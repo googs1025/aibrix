@@ -155,6 +155,14 @@ func (v *PodAutoscalerCustomValidator) validatePodAutoscaler(pa *autoscalingv1al
 			string(autoscalingv1alpha1.APA),
 		}))
 	}
+	if pa.Spec.ScalingStrategy == autoscalingv1alpha1.HPA &&
+		pa.Spec.SubTargetSelector != nil &&
+		pa.Spec.SubTargetSelector.RoleName != "" {
+		allErrs = append(allErrs, field.Forbidden(
+			specPath.Child("subTargetSelector").Child("roleName"),
+			"not supported with scalingStrategy=HPA; use APA or KPA for StormService role-level autoscaling",
+		))
+	}
 
 	// 4. Validate MetricsSources
 	metricsPath := specPath.Child("metricsSources")
