@@ -386,9 +386,6 @@ func (h *stormServiceHarness) cleanupStormService(t *testing.T, name string, exp
 	if err != nil && !apierrors.IsNotFound(err) {
 		t.Fatalf("get StormService %s/%s before cleanup: %v", h.namespace, name, err)
 	}
-	if apierrors.IsNotFound(err) {
-		return
-	}
 
 	roleSets, err := h.dynamicClient.Resource(roleSetGVR).Namespace(h.namespace).List(ctx, metav1.ListOptions{LabelSelector: stormServiceSelector(name)})
 	if err != nil {
@@ -416,10 +413,14 @@ func (h *stormServiceHarness) cleanupStormService(t *testing.T, name string, exp
 	if _, err := waitForPods(ctx, h.kubeClient, h.namespace, name, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := waitForControllerRevisionsDeleted(ctx, h.kubeClient, h.namespace, name, stormService.UID); err != nil {
+	var ownerUID types.UID
+	if stormService != nil {
+		ownerUID = stormService.UID
+	}
+	if err := waitForControllerRevisionsDeleted(ctx, h.kubeClient, h.namespace, name, ownerUID); err != nil {
 		t.Fatal(err)
 	}
-	if err := waitForServiceDeleted(ctx, h.kubeClient, h.namespace, name, stormService.UID); err != nil {
+	if err := waitForServiceDeleted(ctx, h.kubeClient, h.namespace, name, ownerUID); err != nil {
 		t.Fatal(err)
 	}
 	if expectPodGroup {
@@ -500,8 +501,14 @@ func waitForServiceDeleted(ctx context.Context, kubeClient kubernetes.Interface,
 			latest = fmt.Sprintf("get error: %v", err)
 			return false, nil
 		}
-		latest = fmt.Sprintf("ownedByStormService=%t %s", hasOwnerUID(service.OwnerReferences, ownerUID), describeService(service))
-		return false, nil
+		if ownerUID != "" {
+			owned := hasOwnerUID(service.OwnerReferences, ownerUID)
+			latest = fmt.Sprintf("ownedByStormService=%t %s", owned, describeService(service))
+			return !owned, nil
+		}
+		owned := hasStormServiceOwner(service.OwnerReferences, name)
+		latest = fmt.Sprintf("ownedByStormService=%t %s", owned, describeService(service))
+		return !owned, nil
 	})
 	if err != nil {
 		return fmt.Errorf("wait for Service %s/%s deletion: %w; latest observation: %s", namespace, name, err, latest)
@@ -538,7 +545,21 @@ func hasOwnerUID(ownerReferences []metav1.OwnerReference, ownerUID types.UID) bo
 	return false
 }
 
+func hasStormServiceOwner(ownerReferences []metav1.OwnerReference, name string) bool {
+	for _, ownerReference := range ownerReferences {
+		if ownerReference.APIVersion == orchestrationv1alpha1.GroupVersion.String() &&
+			ownerReference.Kind == orchestrationv1alpha1.StormServiceKind &&
+			ownerReference.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func controllerRevisionsWithOwner(revisions []appsv1.ControllerRevision, ownerUID types.UID) []appsv1.ControllerRevision {
+	if ownerUID == "" {
+		return revisions
+	}
 	owned := make([]appsv1.ControllerRevision, 0, len(revisions))
 	for i := range revisions {
 		if hasOwnerUID(revisions[i].OwnerReferences, ownerUID) {
