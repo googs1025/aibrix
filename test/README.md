@@ -99,6 +99,34 @@ or
 - `SKIP_KUBECTL_INSTALL=true` - Skip kubectl installation (default: true)
 - `SKIP_KIND_INSTALL=true` - Skip Kind installation (default: true)
 
+#### StormService Controller E2E
+
+The StormService controller package contains three lifecycle tests that run as
+part of the default controller suite: Replica-mode creation and scaling,
+pause/resume with in-place and fallback updates, and progress-deadline failure
+and recovery. The installation E2E job builds and loads
+`aibrix/inplace-e2e:v1` and `aibrix/inplace-e2e:v2`, which these tests require.
+
+Volcano gang scheduling is opt-in because it requires a cluster with the
+Volcano scheduler and `scheduling.volcano.sh/v1beta1` PodGroup CRD installed.
+With `KUBECONFIG` pointing at a prepared cluster and the StormService, RoleSet,
+and PodSet controllers running, execute only that test with:
+
+```bash
+make test-e2e-stormservice-volcano
+```
+
+Set `AIBRIX_STORMSERVICE_E2E_KEEP_ON_FAILURE=true` to retain StormService,
+RoleSet, PodSet, Pod, ControllerRevision, Service, and PodGroup resources after
+a failure for inspection.
+
+The CI-tested scheduler pair is Kubernetes 1.31.0 with Volcano 1.11.2. AIBrix
+currently compiles against `volcano.sh/apis` v1.11.2 and validates the
+`minMember` and `minTaskMember` PodGroup fields. Volcano 1.14 and newer add the
+different `subGroupPolicy` model used by newer RBG tests; that model is outside
+this suite. Any Volcano upgrade must review the Go API module, installed CRD
+schema, and Volcano's Kubernetes compatibility matrix together.
+
 ### Performance Regression Testing
 
 The `regression/` directory contains benchmark configurations for release testing:
