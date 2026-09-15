@@ -298,3 +298,50 @@ func TestCleanupStormServiceContinuesAfterIdentityListFailure(t *testing.T) {
 		t.Fatal("cleanup did not continue to the Pod check after identity-list failure")
 	}
 }
+
+func TestStrictStormServiceCleanupRetriesAfterFailedAttempt(t *testing.T) {
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+		roleSetGVR: "RoleSetList",
+		podSetGVR:  "PodSetList",
+	})
+	roleSetListCalls := 0
+	dynamicClient.PrependReactor("list", "rolesets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		roleSetListCalls++
+		if roleSetListCalls == 1 {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: roleSetGVR.Group, Resource: roleSetGVR.Resource}, "", fmt.Errorf("denied"))
+		}
+		return false, nil, nil
+	})
+
+	kubeClient := k8sfake.NewSimpleClientset()
+	aibrixClient := aibrixfake.NewSimpleClientset()
+	deleteCalls := 0
+	aibrixClient.Fake.PrependReactor("delete", "stormservices", func(k8stesting.Action) (bool, runtime.Object, error) {
+		deleteCalls++
+		return true, nil, nil
+	})
+
+	harness := &stormServiceHarness{
+		namespace:     "default",
+		kubeClient:    kubeClient,
+		stormServices: aibrixClient.OrchestrationV1alpha1().StormServices("default"),
+		dynamicClient: dynamicClient,
+	}
+	cleanup := newStrictStormServiceCleanup(harness, "storm", false)
+
+	if err := cleanup.run(context.Background()); err == nil || !apierrors.IsForbidden(err) {
+		t.Fatalf("first cleanup error = %v, want Forbidden", err)
+	}
+	if cleanup.completed {
+		t.Fatal("cleanup was marked complete after a failed attempt")
+	}
+	if err := cleanup.run(context.Background()); err != nil {
+		t.Fatalf("retry strict cleanup: %v", err)
+	}
+	if !cleanup.completed {
+		t.Fatal("cleanup was not marked complete after a successful retry")
+	}
+	if deleteCalls != 2 {
+		t.Fatalf("StormService delete calls = %d, want 2 across the failed attempt and retry", deleteCalls)
+	}
+}

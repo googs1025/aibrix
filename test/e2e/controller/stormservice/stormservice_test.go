@@ -41,30 +41,33 @@ import (
 )
 
 func TestStormServiceReplicaLifecycle(t *testing.T) {
-	if !strings.EqualFold(strings.TrimSpace(os.Getenv(stormServiceVolcanoE2EEnv)), "true") {
-		t.Skipf("set %s=true to run StormService replica lifecycle e2e tests", stormServiceVolcanoE2EEnv)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	namespace := stormServiceNamespace()
 	name := fmt.Sprintf("stormservice-replica-lifecycle-%d", time.Now().UnixNano())
 	h := newStormServiceHarness(t, namespace)
-	cleanedUp := false
+	cleanupState := newStrictStormServiceCleanup(h, name, false)
 	cleanup := func() {
-		if cleanedUp {
+		if cleanupState.completed {
 			return
 		}
-		cleanedUp = true
-		h.cleanupStormService(t, name, false)
+		if t.Failed() && strings.EqualFold(strings.TrimSpace(os.Getenv(stormServiceE2EKeepOnFailureEnv)), "true") {
+			h.logRetainedStormServiceResources(t, name, false)
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), stormServiceCleanupTimeout)
+		defer cancel()
+		if err := cleanupState.run(cleanupCtx); err != nil {
+			t.Errorf("cleanup StormService %s/%s: %v", namespace, name, err)
+		}
 	}
+	t.Cleanup(cleanup)
 
 	created, err := h.stormServices.Create(ctx, newReplicaLifecycleStormService(namespace, name, 2), metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("create StormService %s/%s: %v", namespace, name, err)
 	}
-	t.Cleanup(cleanup)
 
 	_, err = waitForStormServiceState(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) bool {
 		return controllerutil.ContainsFinalizer(stormService, stormservicecontroller.StormServiceFinalizer)
@@ -124,8 +127,22 @@ func TestStormServiceReplicaLifecycle(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("scale StormService to three replicas: %v", err)
 	}
-	if _, err := h.waitForRoleSets(ctx, name, 3); err != nil {
+	roleSets, err = h.waitForRoleSets(ctx, name, 3)
+	if err != nil {
 		t.Fatalf("wait for three RoleSets: %v", err)
+	}
+	roleSetIndexes := make(map[string]string, len(roleSets))
+	for i := range roleSets {
+		if !roleSetHasStormServiceOwnerAndMetadata(&roleSets[i], created.UID) {
+			t.Errorf("scaled RoleSet %q does not have StormService controller ownership and required revision/index metadata: %v", roleSets[i].GetName(), roleSets[i].UnstructuredContent())
+			continue
+		}
+		index := roleSets[i].GetAnnotations()[controllerconstants.RoleSetIndexAnnotationKey]
+		if existingRoleSet, found := roleSetIndexes[index]; found {
+			t.Errorf("scaled RoleSets %q and %q share index %q", existingRoleSet, roleSets[i].GetName(), index)
+			continue
+		}
+		roleSetIndexes[index] = roleSets[i].GetName()
 	}
 	if _, err := waitForPods(ctx, h.kubeClient, namespace, name, 3, true); err != nil {
 		t.Fatalf("wait for three ready pods: %v", err)
@@ -154,12 +171,6 @@ func TestStormServiceReplicaLifecycle(t *testing.T) {
 	}
 
 	cleanup()
-	if err := waitForServiceNotFound(ctx, h.kubeClient, namespace, name); err != nil {
-		t.Fatalf("wait for strict Service absence after cleanup: %v", err)
-	}
-	if _, err := h.kubeClient.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("get Service after cleanup error = %v, want NotFound", err)
-	}
 }
 
 func stormServiceHasReplicaStatus(stormService *orchestrationv1alpha1.StormService, replicas int32, updateRevision string) bool {
@@ -222,5 +233,40 @@ func waitForServiceNotFound(ctx context.Context, kubeClient kubernetes.Interface
 	if err != nil {
 		return fmt.Errorf("wait for Service %s/%s strict deletion: %w; latest observation: %s", namespace, name, err, latest)
 	}
+	return nil
+}
+
+type strictStormServiceCleanup struct {
+	harness        *stormServiceHarness
+	name           string
+	expectPodGroup bool
+	completed      bool
+}
+
+func newStrictStormServiceCleanup(harness *stormServiceHarness, name string, expectPodGroup bool) *strictStormServiceCleanup {
+	return &strictStormServiceCleanup{
+		harness:        harness,
+		name:           name,
+		expectPodGroup: expectPodGroup,
+	}
+}
+
+func (c *strictStormServiceCleanup) run(ctx context.Context) error {
+	if c.completed {
+		return nil
+	}
+	if err := c.harness.cleanupStormServiceResources(ctx, c.name, c.expectPodGroup); err != nil {
+		return err
+	}
+	if err := waitForServiceNotFound(ctx, c.harness.kubeClient, c.harness.namespace, c.name); err != nil {
+		return err
+	}
+	if _, err := c.harness.kubeClient.CoreV1().Services(c.harness.namespace).Get(ctx, c.name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		if err == nil {
+			return fmt.Errorf("get Service after cleanup found %s/%s, want NotFound", c.harness.namespace, c.name)
+		}
+		return fmt.Errorf("get Service after cleanup: %w", err)
+	}
+	c.completed = true
 	return nil
 }
