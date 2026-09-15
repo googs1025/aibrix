@@ -81,6 +81,7 @@ type stormServiceHarness struct {
 	kubeClient    kubernetes.Interface
 	stormServices orchestrationclient.StormServiceInterface
 	dynamicClient dynamic.Interface
+	roleSetNames  map[string]map[string]struct{}
 }
 
 func stormServiceNamespace() string {
@@ -98,6 +99,7 @@ func newStormServiceHarness(t *testing.T, namespace string) *stormServiceHarness
 		kubeClient:    kubeClient,
 		stormServices: stormServices,
 		dynamicClient: dynamicClient,
+		roleSetNames:  make(map[string]map[string]struct{}),
 	}
 }
 
@@ -261,6 +263,16 @@ func waitForRoleSets(
 	namespace, stormServiceName string,
 	count int,
 ) ([]unstructured.Unstructured, error) {
+	return waitForRoleSetsObserved(ctx, dynamicClient, namespace, stormServiceName, count, nil)
+}
+
+func waitForRoleSetsObserved(
+	ctx context.Context,
+	dynamicClient dynamic.Interface,
+	namespace, stormServiceName string,
+	count int,
+	observe func([]unstructured.Unstructured),
+) ([]unstructured.Unstructured, error) {
 	selector := stormServiceSelector(stormServiceName)
 	var latest string
 	var observed []unstructured.Unstructured
@@ -271,6 +283,9 @@ func waitForRoleSets(
 			return false, nil
 		}
 		observed = roleSets.Items
+		if observe != nil {
+			observe(roleSets.Items)
+		}
 		latest = describeUnstructuredList(roleSets.Items)
 		return len(roleSets.Items) == count, nil
 	})
@@ -278,6 +293,41 @@ func waitForRoleSets(
 		return observed, fmt.Errorf("wait for %d RoleSets for StormService %q: %w; latest observation: %s", count, stormServiceName, err, latest)
 	}
 	return observed, nil
+}
+
+// waitForRoleSets records every observed generated RoleSet name. Volcano
+// PodGroups are named after RoleSets, so these identities must outlive a
+// preceding StormService deletion for cleanup to find orphaned PodGroups.
+func (h *stormServiceHarness) waitForRoleSets(
+	ctx context.Context,
+	stormServiceName string,
+	count int,
+) ([]unstructured.Unstructured, error) {
+	return waitForRoleSetsObserved(ctx, h.dynamicClient, h.namespace, stormServiceName, count, func(roleSets []unstructured.Unstructured) {
+		h.recordRoleSets(stormServiceName, roleSets)
+	})
+}
+
+func (h *stormServiceHarness) recordRoleSets(stormServiceName string, roleSets []unstructured.Unstructured) {
+	if h.roleSetNames == nil {
+		h.roleSetNames = make(map[string]map[string]struct{})
+	}
+	if h.roleSetNames[stormServiceName] == nil {
+		h.roleSetNames[stormServiceName] = make(map[string]struct{})
+	}
+	for i := range roleSets {
+		if name := roleSets[i].GetName(); name != "" {
+			h.roleSetNames[stormServiceName][name] = struct{}{}
+		}
+	}
+}
+
+func (h *stormServiceHarness) recordedRoleSetNames(stormServiceName string) map[string]struct{} {
+	recorded := make(map[string]struct{})
+	for name := range h.roleSetNames[stormServiceName] {
+		recorded[name] = struct{}{}
+	}
+	return recorded
 }
 
 func waitForPods(
@@ -391,10 +441,7 @@ func (h *stormServiceHarness) cleanupStormService(t *testing.T, name string, exp
 	if err != nil {
 		t.Fatalf("list RoleSets for StormService %s/%s before cleanup: %v", h.namespace, name, err)
 	}
-	roleSetNames := make([]string, 0, len(roleSets.Items))
-	for i := range roleSets.Items {
-		roleSetNames = append(roleSetNames, roleSets.Items[i].GetName())
-	}
+	h.recordRoleSets(name, roleSets.Items)
 
 	foreground := metav1.DeletePropagationForeground
 	if err := h.stormServices.Delete(ctx, name, metav1.DeleteOptions{PropagationPolicy: &foreground}); err != nil && !apierrors.IsNotFound(err) {
@@ -404,7 +451,7 @@ func (h *stormServiceHarness) cleanupStormService(t *testing.T, name string, exp
 	if err := waitForStormServiceDeleted(ctx, h.stormServices, name); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := waitForRoleSets(ctx, h.dynamicClient, h.namespace, name, 0); err != nil {
+	if _, err := h.waitForRoleSets(ctx, name, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := waitForNoPodSets(ctx, h.dynamicClient, h.namespace, name); err != nil {
@@ -424,6 +471,11 @@ func (h *stormServiceHarness) cleanupStormService(t *testing.T, name string, exp
 		t.Fatal(err)
 	}
 	if expectPodGroup {
+		recordedRoleSetNames := h.recordedRoleSetNames(name)
+		roleSetNames := make([]string, 0, len(recordedRoleSetNames))
+		for roleSetName := range recordedRoleSetNames {
+			roleSetNames = append(roleSetNames, roleSetName)
+		}
 		if err := waitForPodGroupsDeleted(ctx, h.dynamicClient, h.namespace, roleSetNames); err != nil {
 			t.Fatal(err)
 		}
