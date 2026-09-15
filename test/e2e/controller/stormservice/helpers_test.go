@@ -58,6 +58,7 @@ const (
 	stormServicePollInterval        = time.Second
 	stormServicePollTimeout         = 3 * time.Minute
 	stormServiceCleanupTimeout      = 3 * time.Minute
+	stormServiceKeepLogTimeout      = 10 * time.Second
 	stormServiceVolcanoDefaultQueue = "default"
 )
 
@@ -195,7 +196,7 @@ func newReplicaLifecycleStormService(namespace, name string, replicas int32) *or
 }
 
 func newUpdateStormService(namespace, name string) *orchestrationv1alpha1.StormService {
-	return newReplicaLifecycleStormService(namespace, name, 2)
+	return newStormService(namespace, name, stormServiceInPlaceImageV1)
 }
 
 func newDeadlineStormService(namespace, name string, deadlineSeconds int32) *orchestrationv1alpha1.StormService {
@@ -426,6 +427,7 @@ func (h *stormServiceHarness) cleanupStormService(t *testing.T, name string, exp
 	t.Helper()
 	if t.Failed() && strings.EqualFold(strings.TrimSpace(os.Getenv(stormServiceE2EKeepOnFailureEnv)), "true") {
 		t.Logf("preserving StormService e2e resources for %s/%s", h.namespace, name)
+		h.logRetainedStormServiceResources(t, name, expectPodGroup)
 		return
 	}
 
@@ -482,8 +484,77 @@ func (h *stormServiceHarness) cleanupStormService(t *testing.T, name string, exp
 	}
 }
 
+// logRetainedStormServiceResources captures cleanup targets after a failed test
+// without changing its outcome. Each API request is bounded and failures are
+// logged rather than reported through testing.T's failure methods.
+func (h *stormServiceHarness) logRetainedStormServiceResources(t *testing.T, name string, expectPodGroup bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), stormServiceKeepLogTimeout)
+	defer cancel()
+
+	roleSets, err := h.dynamicClient.Resource(roleSetGVR).Namespace(h.namespace).List(ctx, metav1.ListOptions{LabelSelector: stormServiceSelector(name)})
+	if err != nil {
+		t.Logf("list retained RoleSets for StormService %s/%s: %v", h.namespace, name, err)
+	} else {
+		h.recordRoleSets(name, roleSets.Items)
+		t.Logf("retained current RoleSets for StormService %s/%s: %s", h.namespace, name, describeUnstructuredList(roleSets.Items))
+	}
+	recordedRoleSetNames := h.recordedRoleSetNames(name)
+	t.Logf("retained recorded RoleSet names for StormService %s/%s: %v", h.namespace, name, roleSetNamesSlice(recordedRoleSetNames))
+
+	podSets, err := h.dynamicClient.Resource(podSetGVR).Namespace(h.namespace).List(ctx, metav1.ListOptions{LabelSelector: stormServiceSelector(name)})
+	if err != nil {
+		t.Logf("list retained PodSets for StormService %s/%s: %v", h.namespace, name, err)
+	} else {
+		t.Logf("retained PodSets for StormService %s/%s: %s", h.namespace, name, describeUnstructuredList(podSets.Items))
+	}
+
+	pods, err := h.kubeClient.CoreV1().Pods(h.namespace).List(ctx, metav1.ListOptions{LabelSelector: stormServiceSelector(name)})
+	if err != nil {
+		t.Logf("list retained pods for StormService %s/%s: %v", h.namespace, name, err)
+	} else {
+		t.Logf("retained pods for StormService %s/%s: %s", h.namespace, name, describePods(pods.Items))
+	}
+
+	revisions, err := h.kubeClient.AppsV1().ControllerRevisions(h.namespace).List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("name=%s", name)})
+	if err != nil {
+		t.Logf("list retained ControllerRevisions for StormService %s/%s: %v", h.namespace, name, err)
+	} else {
+		t.Logf("retained ControllerRevisions for StormService %s/%s: %s", h.namespace, name, describeControllerRevisions(revisions.Items))
+	}
+
+	service, err := h.kubeClient.CoreV1().Services(h.namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Logf("get retained Service %s/%s: %v", h.namespace, name, err)
+	} else {
+		t.Logf("retained Service %s/%s: %s", h.namespace, name, describeService(service))
+	}
+
+	if !expectPodGroup {
+		return
+	}
+	for _, roleSetName := range roleSetNamesSlice(recordedRoleSetNames) {
+		podGroups, err := h.dynamicClient.Resource(volcanoPodGroupGVR).Namespace(h.namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("%s=%s", controllerconstants.RoleSetNameLabelKey, roleSetName),
+		})
+		if err != nil {
+			t.Logf("list retained Volcano PodGroups for RoleSet %s: %v", roleSetName, err)
+			continue
+		}
+		t.Logf("retained Volcano PodGroups for RoleSet %s: %s", roleSetName, describeUnstructuredList(podGroups.Items))
+	}
+}
+
 func stormServiceSelector(name string) string {
 	return fmt.Sprintf("%s=%s", controllerconstants.StormServiceNameLabelKey, name)
+}
+
+func roleSetNamesSlice(roleSetNames map[string]struct{}) []string {
+	names := make([]string, 0, len(roleSetNames))
+	for name := range roleSetNames {
+		names = append(names, name)
+	}
+	return names
 }
 
 func waitForStormServiceDeleted(ctx context.Context, stormServices orchestrationclient.StormServiceInterface, name string) error {
