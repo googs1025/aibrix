@@ -298,6 +298,71 @@ func TestStormServiceUpdateLifecycle(t *testing.T) {
 	cleanup()
 }
 
+func TestStormServiceProgressDeadlineRecovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	namespace := stormServiceNamespace()
+	name := fmt.Sprintf("stormservice-deadline-%d", time.Now().UnixNano())
+	h := newStormServiceHarness(t, namespace)
+	cleanupState := newStrictStormServiceCleanup(h, name, false)
+	cleanup := func() {
+		if cleanupState.completed {
+			return
+		}
+		if t.Failed() && strings.EqualFold(strings.TrimSpace(os.Getenv(stormServiceE2EKeepOnFailureEnv)), "true") {
+			h.logRetainedStormServiceResources(t, name, false)
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), stormServiceCleanupTimeout)
+		defer cleanupCancel()
+		if err := cleanupState.run(cleanupCtx); err != nil {
+			t.Errorf("cleanup StormService %s/%s: %v", namespace, name, err)
+		}
+	}
+	t.Cleanup(cleanup)
+
+	if _, err := h.stormServices.Create(ctx, newDeadlineStormService(namespace, name, 15), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create deadline StormService %s/%s: %v", namespace, name, err)
+	}
+	if _, err := h.waitForRoleSets(ctx, name, 1); err != nil {
+		t.Fatalf("wait for initial deadline RoleSet: %v", err)
+	}
+	if _, err := waitForPods(ctx, h.kubeClient, namespace, name, 1, true); err != nil {
+		t.Fatalf("wait for initial deadline Pod: %v", err)
+	}
+	if _, err := waitForStormServiceState(ctx, h.stormServices, name, stormServiceReadyAtCurrentGeneration); err != nil {
+		t.Fatalf("wait for initial deadline StormService Ready: %v", err)
+	}
+
+	if _, err := updateStormService(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) {
+		container := &stormService.Spec.Template.Spec.Roles[0].Template.Spec.Containers[0]
+		container.Image = stormServiceMissingImage
+		container.ImagePullPolicy = corev1.PullNever
+	}); err != nil {
+		t.Fatalf("start stalled rollout: %v", err)
+	}
+	if _, err := waitForStormServiceState(ctx, h.stormServices, name, stormServiceHasProgressDeadlineExceeded); err != nil {
+		t.Fatalf("wait for ProgressDeadlineExceeded: %v", err)
+	}
+
+	if _, err := updateStormService(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) {
+		container := &stormService.Spec.Template.Spec.Roles[0].Template.Spec.Containers[0]
+		container.Image = stormServiceInPlaceImageV2
+		container.ImagePullPolicy = corev1.PullIfNotPresent
+	}); err != nil {
+		t.Fatalf("recover stalled rollout: %v", err)
+	}
+	if _, err := waitForPods(ctx, h.kubeClient, namespace, name, 1, true); err != nil {
+		t.Fatalf("wait for recovered Ready Pod: %v", err)
+	}
+	if _, err := waitForStormServiceState(ctx, h.stormServices, name, stormServiceRecoveredFromDeadline); err != nil {
+		t.Fatalf("wait for StormService deadline recovery: %v", err)
+	}
+
+	cleanup()
+}
+
 func stormServiceReadyAtCurrentGeneration(stormService *orchestrationv1alpha1.StormService) bool {
 	if stormService == nil || stormService.Status.ObservedGeneration != stormService.Generation ||
 		stormService.Status.Replicas != 1 || stormService.Status.ReadyReplicas != 1 || stormService.Status.NotReadyReplicas != 0 {
@@ -305,6 +370,27 @@ func stormServiceReadyAtCurrentGeneration(stormService *orchestrationv1alpha1.St
 	}
 	ready := condition(stormService.Status.Conditions, orchestrationv1alpha1.StormServiceReady)
 	return ready != nil && ready.Status == corev1.ConditionTrue && ready.Reason == "Ready"
+}
+
+func stormServiceHasProgressDeadlineExceeded(stormService *orchestrationv1alpha1.StormService) bool {
+	if stormService == nil || stormService.Status.ObservedGeneration != stormService.Generation {
+		return false
+	}
+	progressing := condition(stormService.Status.Conditions, orchestrationv1alpha1.StormServiceProgressing)
+	if progressing == nil || progressing.Status != corev1.ConditionFalse || progressing.Reason != stormservicecontroller.ProgressDeadlineExceededReason {
+		return false
+	}
+	ready := condition(stormService.Status.Conditions, orchestrationv1alpha1.StormServiceReady)
+	return ready == nil || ready.Status != corev1.ConditionTrue
+}
+
+func stormServiceRecoveredFromDeadline(stormService *orchestrationv1alpha1.StormService) bool {
+	if !stormServiceReadyAtCurrentGeneration(stormService) ||
+		stormService.Status.UpdatedReplicas != 1 || stormService.Status.UpdatedReadyReplicas != 1 ||
+		stormService.Status.CurrentRevision == "" || stormService.Status.CurrentRevision != stormService.Status.UpdateRevision {
+		return false
+	}
+	return condition(stormService.Status.Conditions, orchestrationv1alpha1.StormServiceProgressing) == nil
 }
 
 func stormServiceHasReplicaStatus(stormService *orchestrationv1alpha1.StormService, replicas int32, updateRevision string) bool {

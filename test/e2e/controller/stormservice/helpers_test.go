@@ -202,7 +202,7 @@ func newUpdateStormService(namespace, name string) *orchestrationv1alpha1.StormS
 }
 
 func newDeadlineStormService(namespace, name string, deadlineSeconds int32) *orchestrationv1alpha1.StormService {
-	stormService := newReplicaLifecycleStormService(namespace, name, 2)
+	stormService := newReplicaLifecycleStormService(namespace, name, 1)
 	stormService.Spec.ProgressDeadlineSeconds = ptr.To(deadlineSeconds)
 	return stormService
 }

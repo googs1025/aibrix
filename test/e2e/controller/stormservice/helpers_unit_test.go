@@ -25,6 +25,7 @@ import (
 	orchestrationv1alpha1 "github.com/vllm-project/aibrix/api/orchestration/v1alpha1"
 	aibrixfake "github.com/vllm-project/aibrix/pkg/client/clientset/versioned/fake"
 	controllerconstants "github.com/vllm-project/aibrix/pkg/controller/constants"
+	stormservicecontroller "github.com/vllm-project/aibrix/pkg/controller/stormservice"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -204,6 +205,53 @@ func TestNewUpdateStormServiceUsesPooledInPlaceFixture(t *testing.T) {
 	}
 	if role := stormService.Spec.Template.Spec.Roles[0]; role.UpdateStrategy.Type != orchestrationv1alpha1.InPlaceIfPossibleRoleUpdateStrategyType {
 		t.Fatalf("role update strategy = %q, want %q", role.UpdateStrategy.Type, orchestrationv1alpha1.InPlaceIfPossibleRoleUpdateStrategyType)
+	}
+}
+
+func TestNewDeadlineStormServiceUsesSingleReplicaRollingFixture(t *testing.T) {
+	stormService := newDeadlineStormService("default", "deadline", 15)
+	if stormService.Spec.Replicas == nil || *stormService.Spec.Replicas != 1 {
+		t.Fatalf("deadline replicas = %v, want 1", stormService.Spec.Replicas)
+	}
+	if stormService.Spec.Mode != orchestrationv1alpha1.StormServiceReplicaMode {
+		t.Fatalf("deadline mode = %q, want Replica", stormService.Spec.Mode)
+	}
+	if stormService.Spec.ProgressDeadlineSeconds == nil || *stormService.Spec.ProgressDeadlineSeconds != 15 {
+		t.Fatalf("deadline seconds = %v, want 15", stormService.Spec.ProgressDeadlineSeconds)
+	}
+	if stormService.Spec.UpdateStrategy.Type != orchestrationv1alpha1.RollingUpdateStormServiceStrategyType {
+		t.Fatalf("deadline update strategy = %q, want RollingUpdate", stormService.Spec.UpdateStrategy.Type)
+	}
+}
+
+func TestStormServiceDeadlineAndRecoveryPredicates(t *testing.T) {
+	stormService := &orchestrationv1alpha1.StormService{
+		ObjectMeta: metav1.ObjectMeta{Generation: 3},
+		Status: orchestrationv1alpha1.StormServiceStatus{
+			ObservedGeneration: 3,
+			Conditions: orchestrationv1alpha1.Conditions{{
+				Type: orchestrationv1alpha1.StormServiceProgressing, Status: corev1.ConditionFalse, Reason: stormservicecontroller.ProgressDeadlineExceededReason,
+			}},
+		},
+	}
+	if !stormServiceHasProgressDeadlineExceeded(stormService) {
+		t.Fatal("expected progress deadline predicate to match")
+	}
+
+	stormService.Status = orchestrationv1alpha1.StormServiceStatus{
+		ObservedGeneration:   3,
+		Replicas:             1,
+		ReadyReplicas:        1,
+		UpdatedReplicas:      1,
+		UpdatedReadyReplicas: 1,
+		CurrentRevision:      "revision",
+		UpdateRevision:       "revision",
+		Conditions: orchestrationv1alpha1.Conditions{{
+			Type: orchestrationv1alpha1.StormServiceReady, Status: corev1.ConditionTrue, Reason: "Ready",
+		}},
+	}
+	if !stormServiceRecoveredFromDeadline(stormService) {
+		t.Fatal("expected recovered deadline predicate to match")
 	}
 }
 
