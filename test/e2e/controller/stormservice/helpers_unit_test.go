@@ -255,6 +255,76 @@ func TestStormServiceDeadlineAndRecoveryPredicates(t *testing.T) {
 	}
 }
 
+func TestEligibleNodeCount(t *testing.T) {
+	nodes := []corev1.Node{
+		{Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}},
+		{Spec: corev1.NodeSpec{Taints: []corev1.Taint{{Effect: corev1.TaintEffectNoSchedule}}}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}},
+		{Spec: corev1.NodeSpec{Unschedulable: true}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}},
+		{Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}}},
+		{Spec: corev1.NodeSpec{Taints: []corev1.Taint{{Effect: corev1.TaintEffectPreferNoSchedule}}}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}},
+	}
+	if got := eligibleNodeCount(nodes); got != 2 {
+		t.Fatalf("eligible node count = %d, want 2", got)
+	}
+}
+
+func TestNewVolcanoStormServiceShapes(t *testing.T) {
+	impossible := newVolcanoStormService("default", "impossible", true, 2)
+	role := impossible.Spec.Template.Spec.Roles[0]
+	strategy := impossible.Spec.Template.Spec.SchedulingStrategy.VolcanoSchedulingStrategy
+	if role.Replicas == nil || *role.Replicas != 3 || strategy.MinMember != 3 || strategy.MinTaskMember[stormServiceWorkerRoleName] != 3 {
+		t.Fatalf("impossible gang shape: role replicas=%v strategy=%+v", role.Replicas, strategy)
+	}
+	if role.Template.Spec.Affinity == nil || role.Template.Spec.Affinity.PodAntiAffinity == nil ||
+		len(role.Template.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) != 1 {
+		t.Fatalf("impossible gang missing required pod anti-affinity: %+v", role.Template.Spec.Affinity)
+	}
+	if role.Template.Spec.Containers[0].Resources.Requests.Cpu().IsZero() {
+		t.Fatal("impossible gang must request non-zero CPU")
+	}
+
+	feasible := newVolcanoStormService("default", "feasible", false, 1)
+	strategy = feasible.Spec.Template.Spec.SchedulingStrategy.VolcanoSchedulingStrategy
+	if len(feasible.Spec.Template.Spec.Roles) != 2 || strategy.MinMember != 2 ||
+		strategy.MinTaskMember["prefill"] != 1 || strategy.MinTaskMember["decode"] != 1 {
+		t.Fatalf("feasible gang shape: roles=%+v strategy=%+v", feasible.Spec.Template.Spec.Roles, strategy)
+	}
+}
+
+func TestVolcanoPodsReadyAndMarked(t *testing.T) {
+	roleSetName := "roleset-generated"
+	pods := []corev1.Pod{
+		volcanoReadyPod("prefill", roleSetName),
+		volcanoReadyPod("decode", roleSetName),
+	}
+	if !volcanoPodsReadyAndMarked(pods, roleSetName) {
+		t.Fatal("expected ready Volcano pod markers")
+	}
+	pods[0].Spec.SchedulerName = "default-scheduler"
+	if volcanoPodsReadyAndMarked(pods, roleSetName) {
+		t.Fatal("wrong scheduler must fail marker predicate")
+	}
+}
+
+func volcanoReadyPod(roleName, roleSetName string) corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				controllerconstants.VolcanoPodGroupNameAnnotationKey: roleSetName,
+				controllerconstants.VolcanoTaskSpecKey:               roleName,
+			},
+			Annotations: map[string]string{
+				controllerconstants.VolcanoPodGroupNameAnnotationKey: roleSetName,
+				controllerconstants.VolcanoTaskSpecKey:               roleName,
+			},
+		},
+		Spec: corev1.PodSpec{SchedulerName: "volcano"},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+		}}},
+	}
+}
+
 func TestStormServiceHarnessRecordsRoleSetNamesAcrossObservations(t *testing.T) {
 	harness := &stormServiceHarness{}
 	harness.recordRoleSets("storm", []unstructured.Unstructured{

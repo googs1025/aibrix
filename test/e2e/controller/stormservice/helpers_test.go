@@ -29,6 +29,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -213,27 +214,73 @@ func newVolcanoStormService(
 	eligibleNodes int,
 ) *orchestrationv1alpha1.StormService {
 	stormService := newStormService(namespace, name, stormServiceInPlaceImageV1)
-	minMember := int32(1)
+	volcanoStrategy := &orchestrationv1alpha1.VolcanoSchedulingStrategySpec{Queue: stormServiceVolcanoDefaultQueue}
 	if impossible {
-		// This makes the single-worker base fixture unschedulable as a gang without
-		// relying on cluster-specific node labels. Task 6 may replace it with its
-		// two-role anti-affinity shape.
-		minMember = 2
-	}
-	if eligibleNodes < 1 {
-		eligibleNodes = 1
+		if eligibleNodes < 1 {
+			eligibleNodes = 1
+		}
+		members := int32(eligibleNodes + 1)
+		memberLabel := "stormservice-volcano-member"
+		role := &stormService.Spec.Template.Spec.Roles[0]
+		role.Replicas = ptr.To(members)
+		role.Template.Labels = map[string]string{memberLabel: name}
+		role.Template.Spec.Containers[0].Resources.Requests = corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("10m"),
+		}
+		role.Template.Spec.Affinity = &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{memberLabel: name}},
+				TopologyKey:   corev1.LabelHostname,
+			}},
+		}}
+		volcanoStrategy.MinMember = members
+		volcanoStrategy.MinTaskMember = map[string]int32{stormServiceWorkerRoleName: members}
+	} else {
+		roles := make([]orchestrationv1alpha1.RoleSpec, 0, 2)
+		for _, roleName := range []string{"prefill", "decode"} {
+			role := stormService.Spec.Template.Spec.Roles[0].DeepCopy()
+			role.Name = roleName
+			role.Template.Spec.Containers[0].Name = roleName
+			roles = append(roles, *role)
+		}
+		stormService.Spec.Template.Spec.Roles = roles
+		volcanoStrategy.MinMember = 2
+		volcanoStrategy.MinTaskMember = map[string]int32{"prefill": 1, "decode": 1}
 	}
 	stormService.Spec.Template.Spec.SchedulingStrategy = &orchestrationv1alpha1.SchedulingStrategy{
-		VolcanoSchedulingStrategy: &orchestrationv1alpha1.VolcanoSchedulingStrategySpec{
-			MinMember:     minMember,
-			MinTaskMember: map[string]int32{stormServiceWorkerRoleName: minMember},
-			Queue:         stormServiceVolcanoDefaultQueue,
-		},
+		VolcanoSchedulingStrategy: volcanoStrategy,
 	}
-	// Keep the shape deterministic until the Volcano-specific tests add their
-	// node-affinity topology. The parameter remains part of the fixture contract.
-	_ = eligibleNodes
 	return stormService
+}
+
+func eligibleNodeCount(nodes []corev1.Node) int {
+	eligible := 0
+	for i := range nodes {
+		node := &nodes[i]
+		if node.Spec.Unschedulable || !nodeReady(node) || hasUntoleratedSchedulingTaint(node) {
+			continue
+		}
+		eligible++
+	}
+	return eligible
+}
+
+func nodeReady(node *corev1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func hasUntoleratedSchedulingTaint(node *corev1.Node) bool {
+	for _, taint := range node.Spec.Taints {
+		if taint.Effect == corev1.TaintEffectNoSchedule || taint.Effect == corev1.TaintEffectNoExecute {
+			return true
+		}
+	}
+	return false
 }
 
 func waitForStormServiceState(
