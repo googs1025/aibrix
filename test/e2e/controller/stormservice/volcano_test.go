@@ -70,7 +70,15 @@ func TestStormServiceVolcanoGangScheduling(t *testing.T) {
 			t.Fatalf("wait for impossible gang RoleSet: %v", err)
 		}
 		roleSetName := roleSets[0].GetName()
-		if _, err := waitForVolcanoPodGroup(ctx, h.dynamicClient, namespace, roleSetName, func(*unstructured.Unstructured) bool { return true }); err != nil {
+		if _, err := waitForVolcanoPodGroup(ctx, h.dynamicClient, namespace, roleSetName, func(podGroup *unstructured.Unstructured) bool {
+			return volcanoPodGroupConfigured(
+				podGroup,
+				roleSetName,
+				roleSets[0].GetUID(),
+				int32(members),
+				map[string]int32{stormServiceWorkerRoleName: int32(members)},
+			)
+		}); err != nil {
 			t.Fatalf("wait for impossible gang PodGroup: %v", err)
 		}
 		if _, err := waitForPods(ctx, h.kubeClient, namespace, name, members, false); err != nil {
@@ -219,24 +227,58 @@ func volcanoPodsReadyAndMarked(pods []corev1.Pod, roleSetName string) bool {
 }
 
 func volcanoPodGroupRunningAndConfigured(podGroup *unstructured.Unstructured, roleSetName string, roleSetUID types.UID) bool {
-	if podGroup == nil || podGroup.GetLabels()[controllerconstants.RoleSetNameLabelKey] != roleSetName ||
-		!hasOwnerUID(podGroup.GetOwnerReferences(), roleSetUID) {
+	if !volcanoPodGroupConfigured(
+		podGroup,
+		roleSetName,
+		roleSetUID,
+		2,
+		map[string]int32{"prefill": 1, "decode": 1},
+	) {
 		return false
 	}
-	minMember, found, err := unstructured.NestedInt64(podGroup.Object, "spec", "minMember")
-	if err != nil || !found || minMember != 2 {
+	phase, found, err := unstructured.NestedString(podGroup.Object, "status", "phase")
+	return err == nil && found && phase == "Running"
+}
+
+func volcanoPodGroupConfigured(
+	podGroup *unstructured.Unstructured,
+	roleSetName string,
+	roleSetUID types.UID,
+	minMember int32,
+	minTaskMembers map[string]int32,
+) bool {
+	if podGroup == nil || podGroup.GetLabels()[controllerconstants.RoleSetNameLabelKey] != roleSetName ||
+		!hasControllerOwnerUID(podGroup.GetOwnerReferences(), roleSetUID) {
+		return false
+	}
+	observedMinMember, found, err := unstructured.NestedInt64(podGroup.Object, "spec", "minMember")
+	if err != nil || !found || observedMinMember != int64(minMember) {
 		return false
 	}
 	queue, found, err := unstructured.NestedString(podGroup.Object, "spec", "queue")
 	if err != nil || !found || queue != stormServiceVolcanoDefaultQueue {
 		return false
 	}
-	minTaskMember, found, err := unstructured.NestedMap(podGroup.Object, "spec", "minTaskMember")
-	if err != nil || !found || integerValue(minTaskMember["prefill"]) != 1 || integerValue(minTaskMember["decode"]) != 1 {
+	observedTasks, found, err := unstructured.NestedMap(podGroup.Object, "spec", "minTaskMember")
+	if err != nil || !found || len(observedTasks) != len(minTaskMembers) {
 		return false
 	}
-	phase, found, err := unstructured.NestedString(podGroup.Object, "status", "phase")
-	return err == nil && found && phase == "Running"
+	for role, expected := range minTaskMembers {
+		if integerValue(observedTasks[role]) != int64(expected) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasControllerOwnerUID(ownerReferences []metav1.OwnerReference, ownerUID types.UID) bool {
+	for i := range ownerReferences {
+		owner := &ownerReferences[i]
+		if owner.UID == ownerUID && owner.Controller != nil && *owner.Controller {
+			return true
+		}
+	}
+	return false
 }
 
 func integerValue(value interface{}) int64 {

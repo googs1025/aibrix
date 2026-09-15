@@ -20,6 +20,9 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +54,37 @@ func TestRequireConsistentForPollsForEntireWindow(t *testing.T) {
 	if checks < 2 {
 		t.Fatalf("consistency checks = %d, want at least 2", checks)
 	}
+}
+
+func TestStormServiceClientsAcceptKubeconfigPathList(t *testing.T) {
+	config := []byte(`apiVersion: v1
+kind: Config
+clusters:
+- name: test
+  cluster:
+    server: https://127.0.0.1
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: test
+current-context: test
+users:
+- name: test
+  user:
+    token: test
+`)
+	first := filepath.Join(t.TempDir(), "first-kubeconfig")
+	second := filepath.Join(t.TempDir(), "second-kubeconfig")
+	if err := os.WriteFile(first, config, 0o600); err != nil {
+		t.Fatalf("write first kubeconfig: %v", err)
+	}
+	if err := os.WriteFile(second, config, 0o600); err != nil {
+		t.Fatalf("write second kubeconfig: %v", err)
+	}
+	t.Setenv("KUBECONFIG", strings.Join([]string{first, second}, string(os.PathListSeparator)))
+
+	stormServiceClients(t, stormServiceE2EDefaultNamespace)
 }
 
 func TestRequireConsistentForStopsOnFailedCheck(t *testing.T) {
@@ -316,6 +350,45 @@ func TestVolcanoPodsReadyAndMarked(t *testing.T) {
 	pods[0].Spec.SchedulerName = "default-scheduler"
 	if volcanoPodsReadyAndMarked(pods, roleSetName) {
 		t.Fatal("wrong scheduler must fail marker predicate")
+	}
+}
+
+func TestVolcanoPodGroupConfigured(t *testing.T) {
+	roleSetUID := types.UID("roleset-uid")
+	podGroup := &unstructured.Unstructured{Object: map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"labels": map[string]interface{}{controllerconstants.RoleSetNameLabelKey: "roleset"},
+			"ownerReferences": []interface{}{map[string]interface{}{
+				"uid": string(roleSetUID), "controller": true,
+			}},
+		},
+		"spec": map[string]interface{}{
+			"minMember": int64(3),
+			"minTaskMember": map[string]interface{}{
+				stormServiceWorkerRoleName: int64(3),
+			},
+			"queue": stormServiceVolcanoDefaultQueue,
+		},
+	}}
+
+	if !volcanoPodGroupConfigured(
+		podGroup,
+		"roleset",
+		roleSetUID,
+		3,
+		map[string]int32{stormServiceWorkerRoleName: 3},
+	) {
+		t.Fatal("expected matching blocked PodGroup configuration")
+	}
+	podGroup.Object["spec"].(map[string]interface{})["minMember"] = int64(2)
+	if volcanoPodGroupConfigured(
+		podGroup,
+		"roleset",
+		roleSetUID,
+		3,
+		map[string]int32{stormServiceWorkerRoleName: 3},
+	) {
+		t.Fatal("incorrect minMember must not match")
 	}
 }
 

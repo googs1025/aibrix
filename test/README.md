@@ -91,7 +91,7 @@ or
 **Environment Variables:**
 - `KIND_E2E=true` - Creates Kind cluster with proper configuration
 - `INSTALL_AIBRIX=true` - Builds images, installs dependencies, and deploys AIBrix
-- `AIBRIX_ROLESET_INPLACE_E2E=true` - Runs RoleSet in-place update e2e tests and builds/loads their local test images when `INSTALL_AIBRIX=true`
+- `AIBRIX_ROLESET_INPLACE_E2E=true` - Runs the additional RoleSet in-place update e2e tests; `INSTALL_AIBRIX=true` builds the shared v1/v2 images whenever the `all` or `controller` suite is selected
 - `AIBRIX_ROLESET_INPLACE_E2E_KEEP_ON_FAILURE=true` - Preserves RoleSet in-place e2e resources for debugging failed runs
 - `AIBRIX_E2E_SUITE=all|gateway|controller|gateway-pd` - Selects the e2e suite; defaults to `all`
 - `AIBRIX_E2E_GATEWAY_URL`, `AIBRIX_E2E_NAMESPACE`, `AIBRIX_E2E_API_KEY`, `AIBRIX_E2E_GATEWAY_NAMESPACE` - Override live-cluster e2e endpoints and namespaces

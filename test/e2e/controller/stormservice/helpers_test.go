@@ -118,9 +118,6 @@ func stormServiceClients(
 	t.Helper()
 
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	if kubeConfig := os.Getenv("KUBECONFIG"); kubeConfig != "" {
-		loadingRules.ExplicitPath = kubeConfig
-	}
 	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		loadingRules,
 		&clientcmd.ConfigOverrides{},
