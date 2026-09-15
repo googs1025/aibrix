@@ -23,6 +23,7 @@ import (
 
 	orchestrationv1alpha1 "github.com/vllm-project/aibrix/api/orchestration/v1alpha1"
 	aibrixfake "github.com/vllm-project/aibrix/pkg/client/clientset/versioned/fake"
+	controllerconstants "github.com/vllm-project/aibrix/pkg/controller/constants"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,6 +35,66 @@ import (
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
+
+func TestStormServiceHasReplicaStatus(t *testing.T) {
+	stormService := &orchestrationv1alpha1.StormService{
+		ObjectMeta: metav1.ObjectMeta{Generation: 4},
+		Status: orchestrationv1alpha1.StormServiceStatus{
+			ObservedGeneration:   4,
+			Replicas:             2,
+			ReadyReplicas:        2,
+			UpdatedReplicas:      2,
+			UpdatedReadyReplicas: 2,
+			NotReadyReplicas:     0,
+			CurrentRevision:      "storm-abc",
+			UpdateRevision:       "storm-abc",
+			Conditions:           orchestrationv1alpha1.Conditions{{Type: orchestrationv1alpha1.StormServiceReady, Status: corev1.ConditionTrue, Reason: "Ready"}},
+			RoleStatuses:         []orchestrationv1alpha1.RoleStatus{{Name: stormServiceWorkerRoleName, ReadyReplicas: 2}},
+		},
+	}
+
+	if !stormServiceHasReplicaStatus(stormService, 2, "storm-abc") {
+		t.Fatal("expected complete ready replica status to match")
+	}
+
+	stormService.Status.UpdatedReadyReplicas = 1
+	if stormServiceHasReplicaStatus(stormService, 2, "storm-abc") {
+		t.Fatal("expected incomplete ready replica status not to match")
+	}
+
+	stormService.Status.UpdatedReadyReplicas = 2
+	stormService.Status.RoleStatuses[0].ReadyReplicas = 1
+	if stormServiceHasReplicaStatus(stormService, 2, "storm-abc") {
+		t.Fatal("expected incomplete worker role status not to match")
+	}
+}
+
+func TestRoleSetHasStormServiceOwnerAndMetadata(t *testing.T) {
+	stormServiceUID := types.UID("storm-uid")
+	roleSet := &unstructured.Unstructured{Object: map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				controllerconstants.RoleSetIndexAnnotationKey:    "0",
+				controllerconstants.RoleSetRevisionAnnotationKey: "storm-abc",
+			},
+			"ownerReferences": []interface{}{map[string]interface{}{
+				"apiVersion": orchestrationv1alpha1.GroupVersion.String(),
+				"kind":       orchestrationv1alpha1.StormServiceKind,
+				"uid":        string(stormServiceUID),
+				"controller": true,
+			}},
+		},
+	}}
+
+	if !roleSetHasStormServiceOwnerAndMetadata(roleSet, stormServiceUID) {
+		t.Fatal("expected RoleSet with owner and required metadata to match")
+	}
+
+	roleSet.SetAnnotations(map[string]string{controllerconstants.RoleSetIndexAnnotationKey: "0"})
+	if roleSetHasStormServiceOwnerAndMetadata(roleSet, stormServiceUID) {
+		t.Fatal("expected RoleSet without revision metadata not to match")
+	}
+}
 
 func TestNewUpdateStormServiceUsesPooledInPlaceFixture(t *testing.T) {
 	stormService := newUpdateStormService("default", "update")
