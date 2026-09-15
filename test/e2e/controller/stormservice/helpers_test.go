@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -409,6 +410,136 @@ func updateStormService(
 		return updated, fmt.Errorf("update StormService %q: %w", name, err)
 	}
 	return updated, nil
+}
+
+// requireConsistentFor runs check through the complete duration. A timeout of
+// the private consistency context is success; cancellation of the caller's
+// context and any failed observation remain errors.
+func requireConsistentFor(
+	ctx context.Context,
+	interval, duration time.Duration,
+	check func(context.Context) error,
+) error {
+	consistencyCtx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+
+	err := wait.PollUntilContextCancel(consistencyCtx, interval, true, func(ctx context.Context) (bool, error) {
+		return false, check(ctx)
+	})
+	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		return nil
+	}
+	return err
+}
+
+func pausedUpdateRemainsUnchanged(
+	roleSets []unstructured.Unstructured,
+	pods []corev1.Pod,
+	roleSetUID, podUID types.UID,
+	wantImage string,
+) bool {
+	if len(roleSets) != 1 || len(pods) != 1 || roleSets[0].GetUID() != roleSetUID || pods[0].UID != podUID {
+		return false
+	}
+	image, found := podContainerImage(&pods[0], stormServiceWorkerContainerName)
+	return found && image == wantImage
+}
+
+func podContainerImage(pod *corev1.Pod, containerName string) (string, bool) {
+	if pod == nil {
+		return "", false
+	}
+	for _, container := range pod.Spec.Containers {
+		if container.Name == containerName {
+			return container.Image, true
+		}
+	}
+	return "", false
+}
+
+func (h *stormServiceHarness) observeRoleSetsAndPods(
+	ctx context.Context,
+	stormServiceName string,
+) ([]unstructured.Unstructured, []corev1.Pod, error) {
+	roleSets, err := h.dynamicClient.Resource(roleSetGVR).Namespace(h.namespace).List(
+		ctx,
+		metav1.ListOptions{LabelSelector: stormServiceSelector(stormServiceName)},
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list RoleSets: %w", err)
+	}
+	h.recordRoleSets(stormServiceName, roleSets.Items)
+	pods, err := h.kubeClient.CoreV1().Pods(h.namespace).List(
+		ctx,
+		metav1.ListOptions{LabelSelector: stormServiceSelector(stormServiceName)},
+	)
+	if err != nil {
+		return roleSets.Items, nil, fmt.Errorf("list Pods: %w", err)
+	}
+	return roleSets.Items, pods.Items, nil
+}
+
+func (h *stormServiceHarness) waitForSingleRoleSetAndPodState(
+	ctx context.Context,
+	stormServiceName string,
+	predicate func(*unstructured.Unstructured, *corev1.Pod) bool,
+) (*unstructured.Unstructured, *corev1.Pod, error) {
+	var observedRoleSet *unstructured.Unstructured
+	var observedPod *corev1.Pod
+	latest := "no observation"
+	err := wait.PollUntilContextTimeout(ctx, stormServicePollInterval, stormServicePollTimeout, true, func(ctx context.Context) (bool, error) {
+		roleSets, pods, err := h.observeRoleSetsAndPods(ctx, stormServiceName)
+		if err != nil {
+			return false, retryPollError(err, false, &latest)
+		}
+		latest = fmt.Sprintf("roleSets=%s pods=%s", describeUnstructuredList(roleSets), describePods(pods))
+		if len(roleSets) != 1 || len(pods) != 1 {
+			return false, nil
+		}
+		observedRoleSet = roleSets[0].DeepCopy()
+		observedPod = pods[0].DeepCopy()
+		return predicate(observedRoleSet, observedPod), nil
+	})
+	if err != nil {
+		return observedRoleSet, observedPod, fmt.Errorf("wait for one RoleSet and Pod for StormService %q: %w; latest observation: %s", stormServiceName, err, latest)
+	}
+	return observedRoleSet, observedPod, nil
+}
+
+func podCompletedInPlaceUpdate(pod *corev1.Pod, originalUID types.UID, originalHash string) bool {
+	if pod == nil || pod.UID != originalUID || !podReady(pod) {
+		return false
+	}
+	image, found := podContainerImage(pod, stormServiceWorkerContainerName)
+	if !found || image != stormServiceInPlaceImageV2 || pod.Labels[controllerconstants.RoleTemplateHashLabelKey] == "" || pod.Labels[controllerconstants.RoleTemplateHashLabelKey] == originalHash {
+		return false
+	}
+	for _, key := range []string{
+		controllerconstants.RoleInPlaceUpdateTargetHashAnnotationKey,
+		controllerconstants.RoleInPlaceUpdateStateAnnotationKey,
+		controllerconstants.RoleInPlaceUpdatePendingReasonAnnotationKey,
+	} {
+		if _, found := pod.Annotations[key]; found {
+			return false
+		}
+	}
+	return true
+}
+
+func podCompletedFallbackUpdate(pod *corev1.Pod, originalUID types.UID) bool {
+	if pod == nil || pod.UID == originalUID || !podReady(pod) {
+		return false
+	}
+	for _, container := range pod.Spec.Containers {
+		if container.Name != stormServiceWorkerContainerName {
+			continue
+		}
+		_, targetPresent := pod.Annotations[controllerconstants.RoleInPlaceUpdateTargetHashAnnotationKey]
+		return container.Image == stormServiceInPlaceImageV2 &&
+			reflect.DeepEqual(container.Command, []string{"sh", "-c", "sleep 3600"}) &&
+			!targetPresent
+	}
+	return false
 }
 
 func condition(conditions orchestrationv1alpha1.Conditions, conditionType orchestrationv1alpha1.ConditionType) *orchestrationv1alpha1.Condition {

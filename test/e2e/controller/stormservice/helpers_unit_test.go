@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	orchestrationv1alpha1 "github.com/vllm-project/aibrix/api/orchestration/v1alpha1"
 	aibrixfake "github.com/vllm-project/aibrix/pkg/client/clientset/versioned/fake"
@@ -35,6 +36,96 @@ import (
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
+
+func TestRequireConsistentForPollsForEntireWindow(t *testing.T) {
+	checks := 0
+	err := requireConsistentFor(context.Background(), time.Millisecond, 5*time.Millisecond, func(context.Context) error {
+		checks++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("require consistent for window: %v", err)
+	}
+	if checks < 2 {
+		t.Fatalf("consistency checks = %d, want at least 2", checks)
+	}
+}
+
+func TestRequireConsistentForStopsOnFailedCheck(t *testing.T) {
+	want := fmt.Errorf("pod changed while paused")
+	err := requireConsistentFor(context.Background(), time.Millisecond, time.Second, func(context.Context) error {
+		return want
+	})
+	if err == nil || err.Error() != want.Error() {
+		t.Fatalf("require consistent for error = %v, want %v", err, want)
+	}
+}
+
+func TestPausedUpdateRemainsUnchanged(t *testing.T) {
+	roleSetUID := types.UID("roleset-uid")
+	podUID := types.UID("pod-uid")
+	roleSets := []unstructured.Unstructured{{Object: map[string]interface{}{
+		"metadata": map[string]interface{}{"uid": string(roleSetUID)},
+	}}}
+	pods := []corev1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{UID: podUID},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: stormServiceWorkerContainerName, Image: stormServiceInPlaceImageV1,
+		}}},
+	}}
+
+	if !pausedUpdateRemainsUnchanged(roleSets, pods, roleSetUID, podUID, stormServiceInPlaceImageV1) {
+		t.Fatal("expected paused update observations to preserve RoleSet, pod, and image")
+	}
+
+	pods[0].Spec.Containers[0].Image = stormServiceInPlaceImageV2
+	if pausedUpdateRemainsUnchanged(roleSets, pods, roleSetUID, podUID, stormServiceInPlaceImageV1) {
+		t.Fatal("expected changed pod image to fail paused consistency predicate")
+	}
+}
+
+func TestPodCompletedInPlaceUpdate(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:    types.UID("pod-uid"),
+			Labels: map[string]string{controllerconstants.RoleTemplateHashLabelKey: "new-hash"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: stormServiceWorkerContainerName, Image: stormServiceInPlaceImageV2,
+		}}},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+		}}},
+	}
+	if !podCompletedInPlaceUpdate(pod, pod.UID, "old-hash") {
+		t.Fatal("expected completed in-place update")
+	}
+	pod.Annotations = map[string]string{controllerconstants.RoleInPlaceUpdateTargetHashAnnotationKey: "new-hash"}
+	if podCompletedInPlaceUpdate(pod, pod.UID, "old-hash") {
+		t.Fatal("target annotation must be cleared before completion")
+	}
+}
+
+func TestPodCompletedFallbackUpdate(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID("replacement")},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:    stormServiceWorkerContainerName,
+			Image:   stormServiceInPlaceImageV2,
+			Command: []string{"sh", "-c", "sleep 3600"},
+		}}},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+		}}},
+	}
+	if !podCompletedFallbackUpdate(pod, types.UID("original")) {
+		t.Fatal("expected completed fallback update")
+	}
+	pod.UID = types.UID("original")
+	if podCompletedFallbackUpdate(pod, types.UID("original")) {
+		t.Fatal("fallback must replace the pod UID")
+	}
+}
 
 func TestStormServiceHasReplicaStatus(t *testing.T) {
 	stormService := &orchestrationv1alpha1.StormService{

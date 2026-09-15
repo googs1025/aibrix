@@ -173,6 +173,140 @@ func TestStormServiceReplicaLifecycle(t *testing.T) {
 	cleanup()
 }
 
+func TestStormServiceUpdateLifecycle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	namespace := stormServiceNamespace()
+	name := fmt.Sprintf("stormservice-update-%d", time.Now().UnixNano())
+	h := newStormServiceHarness(t, namespace)
+	cleanupState := newStrictStormServiceCleanup(h, name, false)
+	cleanup := func() {
+		if cleanupState.completed {
+			return
+		}
+		if t.Failed() && strings.EqualFold(strings.TrimSpace(os.Getenv(stormServiceE2EKeepOnFailureEnv)), "true") {
+			h.logRetainedStormServiceResources(t, name, false)
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), stormServiceCleanupTimeout)
+		defer cleanupCancel()
+		if err := cleanupState.run(cleanupCtx); err != nil {
+			t.Errorf("cleanup StormService %s/%s: %v", namespace, name, err)
+		}
+	}
+	t.Cleanup(cleanup)
+
+	created, err := h.stormServices.Create(ctx, newUpdateStormService(namespace, name), metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create StormService %s/%s: %v", namespace, name, err)
+	}
+	roleSets, err := h.waitForRoleSets(ctx, name, 1)
+	if err != nil {
+		t.Fatalf("wait for update RoleSet: %v", err)
+	}
+	pods, err := waitForPods(ctx, h.kubeClient, namespace, name, 1, true)
+	if err != nil {
+		t.Fatalf("wait for initial ready Pod: %v", err)
+	}
+	if _, err := waitForStormServiceState(ctx, h.stormServices, name, stormServiceReadyAtCurrentGeneration); err != nil {
+		t.Fatalf("wait for initial Ready StormService: %v", err)
+	}
+	roleSetUID := roleSets[0].GetUID()
+	podUID := pods[0].UID
+	initialHash := pods[0].Labels[controllerconstants.RoleTemplateHashLabelKey]
+	if initialHash == "" {
+		t.Fatal("initial Pod is missing role template hash")
+	}
+	if created.UID == "" {
+		t.Fatal("created StormService has empty UID")
+	}
+
+	if _, err := updateStormService(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) {
+		stormService.Spec.Paused = true
+	}); err != nil {
+		t.Fatalf("pause StormService: %v", err)
+	}
+	if _, err := waitForStormServiceState(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) bool {
+		progressing := condition(stormService.Status.Conditions, orchestrationv1alpha1.StormServiceProgressing)
+		return stormService.Status.ObservedGeneration == stormService.Generation && progressing != nil &&
+			progressing.Status == corev1.ConditionUnknown && progressing.Reason == stormservicecontroller.PausedReason
+	}); err != nil {
+		t.Fatalf("wait for paused condition: %v", err)
+	}
+
+	if _, err := updateStormService(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) {
+		stormService.Spec.Template.Spec.Roles[0].Template.Spec.Containers[0].Image = stormServiceInPlaceImageV2
+	}); err != nil {
+		t.Fatalf("set v2 image while paused: %v", err)
+	}
+	if err := requireConsistentFor(ctx, stormServicePollInterval, 5*time.Second, func(ctx context.Context) error {
+		observedRoleSets, observedPods, err := h.observeRoleSetsAndPods(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !pausedUpdateRemainsUnchanged(observedRoleSets, observedPods, roleSetUID, podUID, stormServiceInPlaceImageV1) {
+			return fmt.Errorf("paused rollout changed: roleSets=%s pods=%s", describeUnstructuredList(observedRoleSets), describePods(observedPods))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify paused rollout remains unchanged: %v", err)
+	}
+
+	if _, err := updateStormService(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) {
+		stormService.Spec.Paused = false
+	}); err != nil {
+		t.Fatalf("resume StormService: %v", err)
+	}
+	if _, err := waitForStormServiceState(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) bool {
+		progressing := condition(stormService.Status.Conditions, orchestrationv1alpha1.StormServiceProgressing)
+		return progressing != nil && progressing.Reason == stormservicecontroller.ResumedReason
+	}); err != nil {
+		t.Fatalf("wait for resumed condition: %v", err)
+	}
+	updatedRoleSet, updatedPod, err := h.waitForSingleRoleSetAndPodState(ctx, name, func(roleSet *unstructured.Unstructured, pod *corev1.Pod) bool {
+		return roleSet.GetUID() == roleSetUID && podCompletedInPlaceUpdate(pod, podUID, initialHash)
+	})
+	if err != nil {
+		t.Fatalf("wait for completed in-place update: %v", err)
+	}
+	if updatedRoleSet.GetUID() != roleSetUID || updatedPod.UID != podUID {
+		t.Fatalf("in-place update changed identity: RoleSet %s->%s Pod %s->%s", roleSetUID, updatedRoleSet.GetUID(), podUID, updatedPod.UID)
+	}
+	if _, err := waitForStormServiceState(ctx, h.stormServices, name, stormServiceReadyAtCurrentGeneration); err != nil {
+		t.Fatalf("wait for Ready after in-place update: %v", err)
+	}
+
+	if _, err := updateStormService(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) {
+		stormService.Spec.Template.Spec.Roles[0].Template.Spec.Containers[0].Command = []string{"sh", "-c", "sleep 3600"}
+	}); err != nil {
+		t.Fatalf("set non-image command update: %v", err)
+	}
+	_, replacementPod, err := h.waitForSingleRoleSetAndPodState(ctx, name, func(roleSet *unstructured.Unstructured, pod *corev1.Pod) bool {
+		return roleSet.GetUID() == roleSetUID && podCompletedFallbackUpdate(pod, podUID)
+	})
+	if err != nil {
+		t.Fatalf("wait for fallback replacement: %v", err)
+	}
+	if replacementPod.UID == podUID {
+		t.Fatalf("fallback retained original Pod UID %s", podUID)
+	}
+	if _, err := waitForStormServiceState(ctx, h.stormServices, name, stormServiceReadyAtCurrentGeneration); err != nil {
+		t.Fatalf("wait for Ready after fallback: %v", err)
+	}
+
+	cleanup()
+}
+
+func stormServiceReadyAtCurrentGeneration(stormService *orchestrationv1alpha1.StormService) bool {
+	if stormService == nil || stormService.Status.ObservedGeneration != stormService.Generation ||
+		stormService.Status.Replicas != 1 || stormService.Status.ReadyReplicas != 1 || stormService.Status.NotReadyReplicas != 0 {
+		return false
+	}
+	ready := condition(stormService.Status.Conditions, orchestrationv1alpha1.StormServiceReady)
+	return ready != nil && ready.Status == corev1.ConditionTrue && ready.Reason == "Ready"
+}
+
 func stormServiceHasReplicaStatus(stormService *orchestrationv1alpha1.StormService, replicas int32, updateRevision string) bool {
 	if stormService == nil ||
 		stormService.Status.ObservedGeneration != stormService.Generation ||
