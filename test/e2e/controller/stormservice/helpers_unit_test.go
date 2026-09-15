@@ -233,6 +233,26 @@ func TestWaitForOwnedServiceRetriesTransientError(t *testing.T) {
 	}
 }
 
+func TestWaitForServiceNotFoundRetriesUntilStrictAbsence(t *testing.T) {
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "storm", Namespace: "default"}}
+	kubeClient := k8sfake.NewSimpleClientset()
+	getCalls := 0
+	kubeClient.PrependReactor("get", "services", func(k8stesting.Action) (bool, runtime.Object, error) {
+		getCalls++
+		if getCalls == 1 {
+			return true, service, nil
+		}
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "services"}, "storm")
+	})
+
+	if err := waitForServiceNotFound(context.Background(), kubeClient, "default", "storm"); err != nil {
+		t.Fatalf("wait for strict Service absence: %v", err)
+	}
+	if getCalls != 2 {
+		t.Fatalf("get calls = %d, want 2 after Service was deleted", getCalls)
+	}
+}
+
 func TestCleanupStormServiceContinuesAfterIdentityListFailure(t *testing.T) {
 	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
 		roleSetGVR:         "RoleSetList",

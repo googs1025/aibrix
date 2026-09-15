@@ -20,14 +20,18 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -79,8 +83,9 @@ func TestStormServiceReplicaLifecycle(t *testing.T) {
 	if !service.Spec.PublishNotReadyAddresses {
 		t.Error("Service PublishNotReadyAddresses = false, want true")
 	}
-	if service.Spec.Selector[controllerconstants.StormServiceNameLabelKey] != name {
-		t.Errorf("Service selector[%q] = %q, want %q", controllerconstants.StormServiceNameLabelKey, service.Spec.Selector[controllerconstants.StormServiceNameLabelKey], name)
+	wantServiceSelector := map[string]string{controllerconstants.StormServiceNameLabelKey: name}
+	if !reflect.DeepEqual(service.Spec.Selector, wantServiceSelector) {
+		t.Errorf("Service selector = %v, want %v", service.Spec.Selector, wantServiceSelector)
 	}
 	serviceHasControllerOwner := false
 	for _, ownerReference := range service.OwnerReferences {
@@ -149,6 +154,12 @@ func TestStormServiceReplicaLifecycle(t *testing.T) {
 	}
 
 	cleanup()
+	if err := waitForServiceNotFound(ctx, h.kubeClient, namespace, name); err != nil {
+		t.Fatalf("wait for strict Service absence after cleanup: %v", err)
+	}
+	if _, err := h.kubeClient.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get Service after cleanup error = %v, want NotFound", err)
+	}
 }
 
 func stormServiceHasReplicaStatus(stormService *orchestrationv1alpha1.StormService, replicas int32, updateRevision string) bool {
@@ -193,4 +204,23 @@ func roleSetHasStormServiceOwnerAndMetadata(roleSet *unstructured.Unstructured, 
 		}
 	}
 	return false
+}
+
+func waitForServiceNotFound(ctx context.Context, kubeClient kubernetes.Interface, namespace, name string) error {
+	var latest string
+	err := wait.PollUntilContextTimeout(ctx, stormServicePollInterval, stormServiceCleanupTimeout, true, func(ctx context.Context) (bool, error) {
+		service, err := kubeClient.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, retryPollError(err, false, &latest)
+		}
+		latest = describeService(service)
+		return false, nil
+	})
+	if err != nil {
+		return fmt.Errorf("wait for Service %s/%s strict deletion: %w; latest observation: %s", namespace, name, err, latest)
+	}
+	return nil
 }
