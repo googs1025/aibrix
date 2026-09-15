@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//nolint:lll // Compact Kubernetes fixtures are clearer when their expected fields remain together.
 package e2e
 
 import (
@@ -482,7 +483,7 @@ func TestCleanupStormServiceContinuesAfterIdentityListFailure(t *testing.T) {
 	})
 	aibrixClient := aibrixfake.NewSimpleClientset()
 	deleteCalls := 0
-	aibrixClient.Fake.PrependReactor("delete", "stormservices", func(k8stesting.Action) (bool, runtime.Object, error) {
+	aibrixClient.PrependReactor("delete", "stormservices", func(k8stesting.Action) (bool, runtime.Object, error) {
 		deleteCalls++
 		return false, nil, nil
 	})
@@ -525,7 +526,7 @@ func TestStrictStormServiceCleanupRetriesAfterFailedAttempt(t *testing.T) {
 	kubeClient := k8sfake.NewSimpleClientset()
 	aibrixClient := aibrixfake.NewSimpleClientset()
 	deleteCalls := 0
-	aibrixClient.Fake.PrependReactor("delete", "stormservices", func(k8stesting.Action) (bool, runtime.Object, error) {
+	aibrixClient.PrependReactor("delete", "stormservices", func(k8stesting.Action) (bool, runtime.Object, error) {
 		deleteCalls++
 		return true, nil, nil
 	})

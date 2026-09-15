@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//nolint:lll // E2E polling keeps full client operations and latest-observation diagnostics together.
 package e2e
 
 import (

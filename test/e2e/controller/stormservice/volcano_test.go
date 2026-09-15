@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//nolint:lll // Gang-scheduling polls keep complete API observations in diagnostic errors.
 package e2e
 
 import (

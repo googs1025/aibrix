@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//nolint:lll // Lifecycle assertions retain complete resource context in failure messages.
 package e2e
 
 import (
@@ -40,6 +41,7 @@ import (
 	stormservicecontroller "github.com/vllm-project/aibrix/pkg/controller/stormservice"
 )
 
+//nolint:gocyclo // The sequential assertions intentionally describe one complete controller lifecycle.
 func TestStormServiceReplicaLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -173,6 +175,7 @@ func TestStormServiceReplicaLifecycle(t *testing.T) {
 	cleanup()
 }
 
+//nolint:gocyclo // The pause, in-place, and fallback phases share identities from one live workload.
 func TestStormServiceUpdateLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
