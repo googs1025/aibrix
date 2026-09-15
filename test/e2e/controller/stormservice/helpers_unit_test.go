@@ -18,13 +18,21 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	orchestrationv1alpha1 "github.com/vllm-project/aibrix/api/orchestration/v1alpha1"
+	aibrixfake "github.com/vllm-project/aibrix/pkg/client/clientset/versioned/fake"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestNewUpdateStormServiceUsesPooledInPlaceFixture(t *testing.T) {
@@ -90,5 +98,122 @@ func TestStormServiceHarnessWaitForRoleSetsRecordsObservedNames(t *testing.T) {
 	}
 	if _, found := harness.recordedRoleSetNames("storm")["storm-roleset-a"]; !found {
 		t.Fatalf("harness did not record RoleSet observed through waitForRoleSets")
+	}
+}
+
+func TestWaitForOwnedServiceFailsImmediatelyForForbidden(t *testing.T) {
+	kubeClient := k8sfake.NewSimpleClientset()
+	getCalls := 0
+	kubeClient.PrependReactor("get", "services", func(k8stesting.Action) (bool, runtime.Object, error) {
+		getCalls++
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "services"}, "storm", fmt.Errorf("denied"))
+	})
+
+	_, err := waitForOwnedService(context.Background(), kubeClient, "default", "storm", types.UID("storm-uid"))
+	if !apierrors.IsForbidden(err) {
+		t.Fatalf("wait error = %v, want Forbidden", err)
+	}
+	if getCalls != 1 {
+		t.Fatalf("get calls = %d, want 1 for a permanent error", getCalls)
+	}
+}
+
+func TestWaitForOwnedServiceRetriesNotFound(t *testing.T) {
+	ownerUID := types.UID("storm-uid")
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      "storm",
+		Namespace: "default",
+		OwnerReferences: []metav1.OwnerReference{{
+			UID: ownerUID,
+		}},
+	}}
+	kubeClient := k8sfake.NewSimpleClientset(service)
+	getCalls := 0
+	kubeClient.PrependReactor("get", "services", func(k8stesting.Action) (bool, runtime.Object, error) {
+		getCalls++
+		if getCalls == 1 {
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "services"}, "storm")
+		}
+		return false, nil, nil
+	})
+
+	if _, err := waitForOwnedService(context.Background(), kubeClient, "default", "storm", ownerUID); err != nil {
+		t.Fatalf("wait for owned Service: %v", err)
+	}
+	if getCalls != 2 {
+		t.Fatalf("get calls = %d, want 2 after NotFound retry", getCalls)
+	}
+}
+
+func TestWaitForOwnedServiceRetriesTransientError(t *testing.T) {
+	ownerUID := types.UID("storm-uid")
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      "storm",
+		Namespace: "default",
+		OwnerReferences: []metav1.OwnerReference{{
+			UID: ownerUID,
+		}},
+	}}
+	kubeClient := k8sfake.NewSimpleClientset(service)
+	getCalls := 0
+	kubeClient.PrependReactor("get", "services", func(k8stesting.Action) (bool, runtime.Object, error) {
+		getCalls++
+		if getCalls == 1 {
+			return true, nil, apierrors.NewServiceUnavailable("temporarily unavailable")
+		}
+		return false, nil, nil
+	})
+
+	if _, err := waitForOwnedService(context.Background(), kubeClient, "default", "storm", ownerUID); err != nil {
+		t.Fatalf("wait for owned Service: %v", err)
+	}
+	if getCalls != 2 {
+		t.Fatalf("get calls = %d, want 2 after transient retry", getCalls)
+	}
+}
+
+func TestCleanupStormServiceContinuesAfterIdentityListFailure(t *testing.T) {
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+		roleSetGVR:         "RoleSetList",
+		podSetGVR:          "PodSetList",
+		volcanoPodGroupGVR: "PodGroupList",
+	})
+	roleSetListCalls := 0
+	dynamicClient.PrependReactor("list", "rolesets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		roleSetListCalls++
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: roleSetGVR.Group, Resource: roleSetGVR.Resource}, "", fmt.Errorf("denied"))
+	})
+
+	kubeClient := k8sfake.NewSimpleClientset()
+	podListCalls := 0
+	kubeClient.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		podListCalls++
+		return false, nil, nil
+	})
+	aibrixClient := aibrixfake.NewSimpleClientset()
+	deleteCalls := 0
+	aibrixClient.Fake.PrependReactor("delete", "stormservices", func(k8stesting.Action) (bool, runtime.Object, error) {
+		deleteCalls++
+		return false, nil, nil
+	})
+
+	harness := &stormServiceHarness{
+		namespace:     "default",
+		kubeClient:    kubeClient,
+		stormServices: aibrixClient.OrchestrationV1alpha1().StormServices("default"),
+		dynamicClient: dynamicClient,
+	}
+	err := harness.cleanupStormServiceResources(context.Background(), "storm", false)
+	if err == nil || !apierrors.IsForbidden(err) {
+		t.Fatalf("cleanup error = %v, want joined Forbidden identity-list error", err)
+	}
+	if roleSetListCalls == 0 {
+		t.Fatal("cleanup did not attempt the RoleSet identity list")
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("StormService delete calls = %d, want 1 despite identity-list failure", deleteCalls)
+	}
+	if podListCalls == 0 {
+		t.Fatal("cleanup did not continue to the Pod check after identity-list failure")
 	}
 }

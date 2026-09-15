@@ -18,6 +18,7 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -245,8 +246,7 @@ func waitForStormServiceState(
 	err := wait.PollUntilContextTimeout(ctx, stormServicePollInterval, stormServicePollTimeout, true, func(ctx context.Context) (bool, error) {
 		stormService, err := stormServices.Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			latest = fmt.Sprintf("get error: %v", err)
-			return false, nil
+			return false, retryPollError(err, true, &latest)
 		}
 		observed = stormService
 		latest = describeStormService(stormService)
@@ -280,8 +280,7 @@ func waitForRoleSetsObserved(
 	err := wait.PollUntilContextTimeout(ctx, stormServicePollInterval, stormServicePollTimeout, true, func(ctx context.Context) (bool, error) {
 		roleSets, err := dynamicClient.Resource(roleSetGVR).Namespace(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 		if err != nil {
-			latest = fmt.Sprintf("list error: %v", err)
-			return false, nil
+			return false, retryPollError(err, false, &latest)
 		}
 		observed = roleSets.Items
 		if observe != nil {
@@ -344,8 +343,7 @@ func waitForPods(
 	err := wait.PollUntilContextTimeout(ctx, stormServicePollInterval, stormServicePollTimeout, true, func(ctx context.Context) (bool, error) {
 		pods, err := kubeClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 		if err != nil {
-			latest = fmt.Sprintf("list error: %v", err)
-			return false, nil
+			return false, retryPollError(err, false, &latest)
 		}
 		observed = pods.Items
 		latest = describePods(pods.Items)
@@ -379,8 +377,7 @@ func waitForOwnedService(
 	err := wait.PollUntilContextTimeout(ctx, stormServicePollInterval, stormServicePollTimeout, true, func(ctx context.Context) (bool, error) {
 		service, err := kubeClient.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			latest = fmt.Sprintf("get error: %v", err)
-			return false, nil
+			return false, retryPollError(err, true, &latest)
 		}
 		observed = service
 		latest = describeService(service)
@@ -433,44 +430,52 @@ func (h *stormServiceHarness) cleanupStormService(t *testing.T, name string, exp
 
 	ctx, cancel := context.WithTimeout(context.Background(), stormServiceCleanupTimeout)
 	defer cancel()
+	if err := h.cleanupStormServiceResources(ctx, name, expectPodGroup); err != nil {
+		t.Errorf("cleanup StormService %s/%s: %v", h.namespace, name, err)
+	}
+}
+
+func (h *stormServiceHarness) cleanupStormServiceResources(ctx context.Context, name string, expectPodGroup bool) error {
+	var cleanupErrors []error
 
 	stormService, err := h.stormServices.Get(ctx, name, metav1.GetOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
-		t.Fatalf("get StormService %s/%s before cleanup: %v", h.namespace, name, err)
-	}
-
-	roleSets, err := h.dynamicClient.Resource(roleSetGVR).Namespace(h.namespace).List(ctx, metav1.ListOptions{LabelSelector: stormServiceSelector(name)})
-	if err != nil {
-		t.Fatalf("list RoleSets for StormService %s/%s before cleanup: %v", h.namespace, name, err)
-	}
-	h.recordRoleSets(name, roleSets.Items)
-
-	foreground := metav1.DeletePropagationForeground
-	if err := h.stormServices.Delete(ctx, name, metav1.DeleteOptions{PropagationPolicy: &foreground}); err != nil && !apierrors.IsNotFound(err) {
-		t.Fatalf("foreground delete StormService %s/%s: %v", h.namespace, name, err)
-	}
-
-	if err := waitForStormServiceDeleted(ctx, h.stormServices, name); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.waitForRoleSets(ctx, name, 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := waitForNoPodSets(ctx, h.dynamicClient, h.namespace, name); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := waitForPods(ctx, h.kubeClient, h.namespace, name, 0, false); err != nil {
-		t.Fatal(err)
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("get StormService identity: %w", err))
 	}
 	var ownerUID types.UID
 	if stormService != nil {
 		ownerUID = stormService.UID
 	}
+
+	roleSets, err := h.dynamicClient.Resource(roleSetGVR).Namespace(h.namespace).List(ctx, metav1.ListOptions{LabelSelector: stormServiceSelector(name)})
+	if err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("list RoleSet identities: %w", err))
+	} else {
+		h.recordRoleSets(name, roleSets.Items)
+	}
+
+	foreground := metav1.DeletePropagationForeground
+	if err := h.stormServices.Delete(ctx, name, metav1.DeleteOptions{PropagationPolicy: &foreground}); err != nil && !apierrors.IsNotFound(err) {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("foreground delete StormService: %w", err))
+	}
+
+	if err := waitForStormServiceDeleted(ctx, h.stormServices, name); err != nil {
+		cleanupErrors = append(cleanupErrors, err)
+	}
+	if _, err := h.waitForRoleSets(ctx, name, 0); err != nil {
+		cleanupErrors = append(cleanupErrors, err)
+	}
+	if err := waitForNoPodSets(ctx, h.dynamicClient, h.namespace, name); err != nil {
+		cleanupErrors = append(cleanupErrors, err)
+	}
+	if _, err := waitForPods(ctx, h.kubeClient, h.namespace, name, 0, false); err != nil {
+		cleanupErrors = append(cleanupErrors, err)
+	}
 	if err := waitForControllerRevisionsDeleted(ctx, h.kubeClient, h.namespace, name, ownerUID); err != nil {
-		t.Fatal(err)
+		cleanupErrors = append(cleanupErrors, err)
 	}
 	if err := waitForServiceDeleted(ctx, h.kubeClient, h.namespace, name, ownerUID); err != nil {
-		t.Fatal(err)
+		cleanupErrors = append(cleanupErrors, err)
 	}
 	if expectPodGroup {
 		recordedRoleSetNames := h.recordedRoleSetNames(name)
@@ -479,9 +484,10 @@ func (h *stormServiceHarness) cleanupStormService(t *testing.T, name string, exp
 			roleSetNames = append(roleSetNames, roleSetName)
 		}
 		if err := waitForPodGroupsDeleted(ctx, h.dynamicClient, h.namespace, roleSetNames); err != nil {
-			t.Fatal(err)
+			cleanupErrors = append(cleanupErrors, err)
 		}
 	}
+	return errors.Join(cleanupErrors...)
 }
 
 // logRetainedStormServiceResources captures cleanup targets after a failed test
@@ -557,6 +563,23 @@ func roleSetNamesSlice(roleSetNames map[string]struct{}) []string {
 	return names
 }
 
+// retryPollError preserves the latest API observation while allowing only
+// expected appearance NotFounds and transient API failures to be retried.
+func retryPollError(err error, retryNotFound bool, latest *string) error {
+	*latest = fmt.Sprintf("API error: %v", err)
+	if retryNotFound && apierrors.IsNotFound(err) {
+		return nil
+	}
+	if apierrors.IsTimeout(err) ||
+		apierrors.IsServerTimeout(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsInternalError(err) {
+		return nil
+	}
+	return err
+}
+
 func waitForStormServiceDeleted(ctx context.Context, stormServices orchestrationclient.StormServiceInterface, name string) error {
 	var latest string
 	err := wait.PollUntilContextTimeout(ctx, stormServicePollInterval, stormServiceCleanupTimeout, true, func(ctx context.Context) (bool, error) {
@@ -565,8 +588,7 @@ func waitForStormServiceDeleted(ctx context.Context, stormServices orchestration
 			return true, nil
 		}
 		if err != nil {
-			latest = fmt.Sprintf("get error: %v", err)
-			return false, nil
+			return false, retryPollError(err, false, &latest)
 		}
 		latest = describeStormService(stormService)
 		return false, nil
@@ -583,8 +605,7 @@ func waitForNoPodSets(ctx context.Context, dynamicClient dynamic.Interface, name
 	err := wait.PollUntilContextTimeout(ctx, stormServicePollInterval, stormServiceCleanupTimeout, true, func(ctx context.Context) (bool, error) {
 		podSets, err := dynamicClient.Resource(podSetGVR).Namespace(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 		if err != nil {
-			latest = fmt.Sprintf("list error: %v", err)
-			return false, nil
+			return false, retryPollError(err, false, &latest)
 		}
 		latest = describeUnstructuredList(podSets.Items)
 		return len(podSets.Items) == 0, nil
@@ -600,8 +621,7 @@ func waitForControllerRevisionsDeleted(ctx context.Context, kubeClient kubernete
 	err := wait.PollUntilContextTimeout(ctx, stormServicePollInterval, stormServiceCleanupTimeout, true, func(ctx context.Context) (bool, error) {
 		revisions, err := kubeClient.AppsV1().ControllerRevisions(namespace).List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("name=%s", name)})
 		if err != nil {
-			latest = fmt.Sprintf("list error: %v", err)
-			return false, nil
+			return false, retryPollError(err, false, &latest)
 		}
 		owned := controllerRevisionsWithOwner(revisions.Items, ownerUID)
 		latest = describeControllerRevisions(owned)
@@ -621,8 +641,7 @@ func waitForServiceDeleted(ctx context.Context, kubeClient kubernetes.Interface,
 			return true, nil
 		}
 		if err != nil {
-			latest = fmt.Sprintf("get error: %v", err)
-			return false, nil
+			return false, retryPollError(err, false, &latest)
 		}
 		if ownerUID != "" {
 			owned := hasOwnerUID(service.OwnerReferences, ownerUID)
@@ -646,8 +665,7 @@ func waitForPodGroupsDeleted(ctx context.Context, dynamicClient dynamic.Interfac
 		err := wait.PollUntilContextTimeout(ctx, stormServicePollInterval, stormServiceCleanupTimeout, true, func(ctx context.Context) (bool, error) {
 			podGroups, err := dynamicClient.Resource(volcanoPodGroupGVR).Namespace(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 			if err != nil {
-				latest = fmt.Sprintf("list error: %v", err)
-				return false, nil
+				return false, retryPollError(err, false, &latest)
 			}
 			latest = describeUnstructuredList(podGroups.Items)
 			return len(podGroups.Items) == 0, nil
