@@ -13,5 +13,5 @@ spec:
             - --leader-election-id=aibrix-controller-manager
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=0
-            - --controllers=stormservice-controller,roleset-controller,podset-controller
+            - --controllers=stormservice-controller
             - --disable-webhook

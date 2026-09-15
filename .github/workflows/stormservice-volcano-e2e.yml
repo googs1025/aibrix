@@ -140,7 +140,7 @@ jobs:
           kubectl apply --server-side -k test/e2e/controller/stormservice/testdata
           kubectl rollout status deployment/aibrix-controller-manager -n aibrix-system --timeout=5m
           args="$(kubectl get deployment/aibrix-controller-manager -n aibrix-system -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].args}')"
-          grep -q -- '--controllers=stormservice-controller,roleset-controller,podset-controller' <<<"${args}"
+          grep -q -- '--controllers=stormservice-controller' <<<"${args}"
           grep -q -- '--disable-webhook' <<<"${args}"
 
       - name: Run StormService Volcano gang E2E

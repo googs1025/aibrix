@@ -166,6 +166,9 @@ func TestRoleSetHasStormServiceOwnerAndMetadata(t *testing.T) {
 	stormServiceUID := types.UID("storm-uid")
 	roleSet := &unstructured.Unstructured{Object: map[string]interface{}{
 		"metadata": map[string]interface{}{
+			"labels": map[string]interface{}{
+				controllerconstants.StormServiceRevisionLabelKey: "storm-abc",
+			},
 			"annotations": map[string]interface{}{
 				controllerconstants.RoleSetIndexAnnotationKey:    "0",
 				controllerconstants.RoleSetRevisionAnnotationKey: "storm-abc",
@@ -186,6 +189,15 @@ func TestRoleSetHasStormServiceOwnerAndMetadata(t *testing.T) {
 	roleSet.SetAnnotations(map[string]string{controllerconstants.RoleSetIndexAnnotationKey: "0"})
 	if roleSetHasStormServiceOwnerAndMetadata(roleSet, stormServiceUID) {
 		t.Fatal("expected RoleSet without revision metadata not to match")
+	}
+
+	roleSet.SetAnnotations(map[string]string{
+		controllerconstants.RoleSetIndexAnnotationKey:    "0",
+		controllerconstants.RoleSetRevisionAnnotationKey: "storm-abc",
+	})
+	roleSet.SetLabels(nil)
+	if roleSetHasStormServiceOwnerAndMetadata(roleSet, stormServiceUID) {
+		t.Fatal("expected RoleSet without StormService revision label not to match")
 	}
 }
 

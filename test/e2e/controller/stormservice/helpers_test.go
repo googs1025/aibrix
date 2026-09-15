@@ -460,24 +460,33 @@ func updateStormService(
 	return updated, nil
 }
 
-// requireConsistentFor runs check through the complete duration. A timeout of
-// the private consistency context is success; cancellation of the caller's
-// context and any failed observation remain errors.
+// requireConsistentFor runs check through the complete duration. The timer
+// controls only the observation window; checks retain the caller's longer
+// context so client-side rate limiting cannot fail a final boundary sample.
 func requireConsistentFor(
 	ctx context.Context,
 	interval, duration time.Duration,
 	check func(context.Context) error,
 ) error {
-	consistencyCtx, cancel := context.WithTimeout(ctx, duration)
-	defer cancel()
-
-	err := wait.PollUntilContextCancel(consistencyCtx, interval, true, func(ctx context.Context) (bool, error) {
-		return false, check(ctx)
-	})
-	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-		return nil
+	if err := check(ctx); err != nil {
+		return err
 	}
-	return err
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		case <-ticker.C:
+			if err := check(ctx); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func pausedUpdateRemainsUnchanged(

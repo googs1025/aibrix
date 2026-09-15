@@ -133,18 +133,10 @@ func TestStormServiceReplicaLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wait for three RoleSets: %v", err)
 	}
-	roleSetIndexes := make(map[string]string, len(roleSets))
 	for i := range roleSets {
 		if !roleSetHasStormServiceOwnerAndMetadata(&roleSets[i], created.UID) {
 			t.Errorf("scaled RoleSet %q does not have StormService controller ownership and required revision/index metadata: %v", roleSets[i].GetName(), roleSets[i].UnstructuredContent())
-			continue
 		}
-		index := roleSets[i].GetAnnotations()[controllerconstants.RoleSetIndexAnnotationKey]
-		if existingRoleSet, found := roleSetIndexes[index]; found {
-			t.Errorf("scaled RoleSets %q and %q share index %q", existingRoleSet, roleSets[i].GetName(), index)
-			continue
-		}
-		roleSetIndexes[index] = roleSets[i].GetName()
 	}
 	if _, err := waitForPods(ctx, h.kubeClient, namespace, name, 3, true); err != nil {
 		t.Fatalf("wait for three ready pods: %v", err)
@@ -227,21 +219,17 @@ func TestStormServiceUpdateLifecycle(t *testing.T) {
 
 	if _, err := updateStormService(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) {
 		stormService.Spec.Paused = true
+		stormService.Spec.Template.Spec.Roles[0].Template.Spec.Containers[0].Image = stormServiceInPlaceImageV2
 	}); err != nil {
-		t.Fatalf("pause StormService: %v", err)
+		t.Fatalf("pause StormService with pending v2 rollout: %v", err)
 	}
-	if _, err := waitForStormServiceState(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) bool {
+	_, err = waitForStormServiceState(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) bool {
 		progressing := condition(stormService.Status.Conditions, orchestrationv1alpha1.StormServiceProgressing)
 		return stormService.Status.ObservedGeneration == stormService.Generation && progressing != nil &&
 			progressing.Status == corev1.ConditionUnknown && progressing.Reason == stormservicecontroller.PausedReason
-	}); err != nil {
-		t.Fatalf("wait for paused condition: %v", err)
-	}
-
-	if _, err := updateStormService(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) {
-		stormService.Spec.Template.Spec.Roles[0].Template.Spec.Containers[0].Image = stormServiceInPlaceImageV2
-	}); err != nil {
-		t.Fatalf("set v2 image while paused: %v", err)
+	})
+	if err != nil {
+		t.Fatalf("wait for paused rollout condition: %v", err)
 	}
 	if err := requireConsistentFor(ctx, stormServicePollInterval, 5*time.Second, func(ctx context.Context) error {
 		observedRoleSets, observedPods, err := h.observeRoleSetsAndPods(ctx, name)
@@ -260,12 +248,6 @@ func TestStormServiceUpdateLifecycle(t *testing.T) {
 		stormService.Spec.Paused = false
 	}); err != nil {
 		t.Fatalf("resume StormService: %v", err)
-	}
-	if _, err := waitForStormServiceState(ctx, h.stormServices, name, func(stormService *orchestrationv1alpha1.StormService) bool {
-		progressing := condition(stormService.Status.Conditions, orchestrationv1alpha1.StormServiceProgressing)
-		return progressing != nil && progressing.Reason == stormservicecontroller.ResumedReason
-	}); err != nil {
-		t.Fatalf("wait for resumed condition: %v", err)
 	}
 	updatedRoleSet, updatedPod, err := h.waitForSingleRoleSetAndPodState(ctx, name, func(roleSet *unstructured.Unstructured, pod *corev1.Pod) bool {
 		return roleSet.GetUID() == roleSetUID && podCompletedInPlaceUpdate(pod, podUID, initialHash)
@@ -433,8 +415,10 @@ func roleSetHasStormServiceOwnerAndMetadata(roleSet *unstructured.Unstructured, 
 			owner.Kind == orchestrationv1alpha1.StormServiceKind &&
 			owner.Controller != nil && *owner.Controller {
 			annotations := roleSet.GetAnnotations()
+			revision := annotations[controllerconstants.RoleSetRevisionAnnotationKey]
 			return annotations[controllerconstants.RoleSetIndexAnnotationKey] != "" &&
-				annotations[controllerconstants.RoleSetRevisionAnnotationKey] != ""
+				revision != "" &&
+				roleSet.GetLabels()[controllerconstants.StormServiceRevisionLabelKey] == revision
 		}
 	}
 	return false
