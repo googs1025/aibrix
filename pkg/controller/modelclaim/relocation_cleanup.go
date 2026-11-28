@@ -139,12 +139,10 @@ func (r *ModelClaimReconciler) retrySourceStop(parent context.Context, claim *mo
 		ModelName: modelName, Mode: DeactivateStop, InstanceID: instanceID,
 	})
 	if err != nil {
-		relocationCleanupTotal.WithLabelValues("retry", "stop_unconfirmed").Inc()
 		r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RelocatedEngineStopRetry",
 			"will retry stopping the old engine on %s: %v", pod.Name, err)
 		return
 	}
-	relocationCleanupTotal.WithLabelValues("requested", "stop_accepted").Inc()
 	r.Recorder.Eventf(claim, corev1.EventTypeNormal, "RelocatedEngineStopRequested",
 		"requested a stop for the old engine on %s", pod.Name)
 }

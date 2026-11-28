@@ -172,14 +172,6 @@ var (
 		},
 		[]string{"action", "result"},
 	)
-	relocationCleanupTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Subsystem: constants.AibrixSubsystemName,
-			Name:      "modelclaim_relocation_cleanup_total",
-			Help:      "Count of source engine cleanup decisions with a bounded result and reason.",
-		},
-		[]string{"result", "reason"},
-	)
 )
 
 func init() {
@@ -194,7 +186,6 @@ func init() {
 		poolPolicyActionsTotal,
 		preemptionAttemptsTotal,
 		preemptionVictimsTotal,
-		relocationCleanupTotal,
 	)
 }
 
