@@ -1078,6 +1078,42 @@ def test_endpoints_activate_list_deactivate():
     assert all(m["model_name"] != "ep1" for m in listed["models"])
 
 
+def test_deactivate_endpoint_leaves_a_replacement_on_the_same_port(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AIBRIX_WEIGHT_CACHE_DIR", str(tmp_path))
+    client = _make_test_client()
+    activation = {"model_name": "ep1", "artifact_url": "hf://x", "port": 20555}
+    assert (
+        client.post("/v1/runtime/models/activate", json=activation).status_code == 200
+    )
+    original = client.get("/v1/runtime/snapshot").json()["models"][0]
+    original_id = original.get("instance_id")
+    assert isinstance(original_id, str) and original_id
+
+    endpoint = "/v1/runtime/models/deactivate"
+    original_stop = {"model_name": "ep1", "instance_id": original_id}
+    assert client.post(endpoint, json=original_stop).json() == {"status": "success"}
+    assert client.get("/v1/runtime/snapshot").json()["models"] == []
+
+    assert (
+        client.post("/v1/runtime/models/activate", json=activation).status_code == 200
+    )
+    replacement = client.get("/v1/runtime/snapshot").json()["models"][0]
+    assert replacement["port"] == original["port"]
+    assert replacement["instance_id"] != original_id
+
+    assert client.post(endpoint, json=original_stop).json() == {"status": "success"}
+    current = client.get("/v1/runtime/snapshot").json()["models"][0]
+    assert current["instance_id"] == replacement["instance_id"]
+    assert current["phase"] == replacement["phase"]
+
+    replacement_stop = {"model_name": "ep1", "instance_id": replacement["instance_id"]}
+    assert client.post(endpoint, json=replacement_stop).json() == {"status": "success"}
+    assert client.post(endpoint, json=replacement_stop).json() == {"status": "success"}
+    assert client.get("/v1/runtime/snapshot").json()["models"] == []
+
+
 def test_a_deactivate_that_waits_does_not_stall_the_other_endpoints():
     # A deactivate waits for the runtime's operation lock, which an activation
     # that downloads weights, or a sleep, can hold for a minute. Waiting on the
@@ -1364,7 +1400,7 @@ def test_snapshot_reports_runtime_state(monkeypatch, tmp_path):
 
     monkeypatch.setenv("AIBRIX_WEIGHT_CACHE_DIR", str(tmp_path))
     agent = make_agent()
-    agent.activate(
+    inst = agent.activate(
         model_name="qwen",
         artifact_url="hf://Qwen/Qwen3-0.6B",
         claim_ref={"namespace": "default", "name": "qwen", "uid": "claim-uid"},
@@ -1409,6 +1445,7 @@ def test_snapshot_reports_runtime_state(monkeypatch, tmp_path):
     assert observed.pop("last_transition").tzinfo is not None
     assert observed == {
         "model_name": "qwen",
+        "instance_id": inst.instance_id,
         "artifact_url": "hf://Qwen/Qwen3-0.6B",
         "claim_ref": {
             "namespace": "default",

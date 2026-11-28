@@ -1150,20 +1150,29 @@ func TestHTTPRuntimeActivate_HTTP500(t *testing.T) {
 }
 
 func TestHTTPRuntimeDeactivate(t *testing.T) {
-	var gotMode string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/v1/runtime/models/deactivate", r.URL.Path)
-		var req DeactivateRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		gotMode = string(req.Mode)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
+	for _, tc := range []struct {
+		name, instanceID string
+		want             map[string]string
+	}{
+		{"legacy", "", map[string]string{"model_name": "m1", "mode": "stop"}},
+		{"scoped", "engine-1", map[string]string{"model_name": "m1", "mode": "stop", "instance_id": "engine-1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/v1/runtime/models/deactivate", r.URL.Path)
+				var req map[string]string
+				assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+				assert.Equal(t, tc.want, req)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
 
-	c, host, port := clientForServer(srv)
-	err := c.Deactivate(context.Background(), host, port, &DeactivateRequest{ModelName: "m1", Mode: DeactivateStop})
-	require.NoError(t, err)
-	assert.Equal(t, "stop", gotMode)
+			c, host, port := clientForServer(srv)
+			require.NoError(t, c.Deactivate(context.Background(), host, port, &DeactivateRequest{
+				ModelName: "m1", Mode: DeactivateStop, InstanceID: tc.instanceID,
+			}))
+		})
+	}
 }
 
 func TestHTTPRuntimeListModels(t *testing.T) {

@@ -15,6 +15,8 @@
 """Failure-convergence tests for the ModelClaim runtime engine supervisor."""
 
 import signal
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -97,6 +99,31 @@ def test_re_adopt_keeps_a_live_engine_without_relaunching(tmp_path, monkeypatch)
     assert adopted[0].phase == "active"
     assert adopted[0].restart_count == 1
     assert runtime.snapshot_metrics().re_adoption_outcomes == {"success": 1}
+
+
+@pytest.mark.parametrize("saved_id", [None, "original-activation"])
+def test_re_adopt_persists_the_instance_id_across_runtime_restarts(
+    tmp_path, monkeypatch, saved_id
+):
+    registry = EngineRegistry(tmp_path / "engines.json")
+    record = _record()
+    if saved_id is not None:
+        record["instance_id"] = saved_id
+    registry.save([record])
+    monkeypatch.setattr(runtime_module, "pid_is_alive", lambda pid: pid == 4321)
+    monkeypatch.setattr(runtime_module, "process_start_time", lambda pid: "123456")
+    monkeypatch.setattr(runtime_module, "engine_ready", lambda port: port == 8100)
+    monkeypatch.setattr(runtime_module, "gpu_memory_observation", lambda: ([], {}))
+
+    runtime = ModelRuntime(_ControlledLauncher(), registry=registry)
+    persisted_id = registry.load()[0].get("instance_id")
+    assert isinstance(persisted_id, str) and persisted_id
+    if saved_id is not None:
+        assert persisted_id == saved_id
+    assert runtime.snapshot()["models"][0]["instance_id"] == persisted_id
+
+    restarted = ModelRuntime(_ControlledLauncher(), registry=registry)
+    assert restarted.snapshot()["models"][0]["instance_id"] == persisted_id
 
 
 def test_re_adopt_rejects_a_reused_pid(tmp_path, monkeypatch):
@@ -686,6 +713,40 @@ def test_supervisor_fails_a_sleeping_engine_that_exits(tmp_path, monkeypatch):
     assert inst.phase == "failed"
 
 
+@pytest.mark.parametrize("write_failure", [False, True])
+def test_guarded_deactivate_removes_a_clean_failed_record_without_signaling(
+    tmp_path, monkeypatch, write_failure
+):
+    monkeypatch.setenv("AIBRIX_WEIGHT_CACHE_DIR", str(tmp_path))
+    runtime, launcher, registry, inst = _engine_asleep(tmp_path, monkeypatch)
+    inst.proc.alive = False
+    runtime.supervise_once()
+    assert inst.phase == "failed"
+    assert not inst.stop_pending
+    # By the time the controller stops the failed record, the group ID may
+    # belong to an unrelated process.
+    monkeypatch.setattr(runtime_module, "process_group_is_alive", lambda pid: True)
+
+    if write_failure:
+
+        def fail_save(_):
+            raise OSError("registry unavailable")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(registry, "save", fail_save)
+            with pytest.raises(OSError, match="registry unavailable"):
+                runtime.deactivate("m", instance_id=inst.instance_id)
+        assert runtime.list_models() == [inst]
+        assert inst.phase == "failed"
+        assert registry.load()[0]["instance_id"] == inst.instance_id
+
+    runtime.deactivate("m", instance_id=inst.instance_id)
+
+    assert launcher.stopped == []
+    assert runtime.list_models() == []
+    assert registry.load() == []
+
+
 def test_re_adoption_fails_a_sleeping_engine_that_is_gone(tmp_path, monkeypatch):
     record = _record()
     record["phase"] = "sleeping"
@@ -788,3 +849,48 @@ def test_production_singleton_enables_registry_and_supervisor(tmp_path, monkeypa
     finally:
         runtime.stop_supervisor()
         runtime_module._AGENT = None
+
+
+def test_concurrent_runtime_initialization_keeps_one_legacy_instance_id(
+    tmp_path, monkeypatch
+):
+    registry = EngineRegistry(tmp_path / "engines.json")
+    registry.save([_record()])
+    monkeypatch.setattr(runtime_module, "_AGENT", None)
+    monkeypatch.delenv("AIBRIX_MODEL_RUNTIME_MOCK", raising=False)
+    monkeypatch.setenv("AIBRIX_ENGINE_REGISTRY_PATH", str(registry.path))
+    monkeypatch.setattr(runtime_module, "SubprocessEngineLauncher", _ControlledLauncher)
+    monkeypatch.setattr(runtime_module, "pid_is_alive", lambda pid: pid == 4321)
+    monkeypatch.setattr(runtime_module, "process_start_time", lambda pid: "123456")
+    monkeypatch.setattr(runtime_module, "engine_ready", lambda port: port == 8100)
+
+    first_read = threading.Event()
+    second_read = threading.Event()
+    load = EngineRegistry.load
+
+    def load_with_overlap(self):
+        records = load(self)
+        if first_read.is_set():
+            second_read.set()
+        else:
+            first_read.set()
+            # Give the concurrent caller time to read the same legacy record.
+            second_read.wait(1)
+        return records
+
+    monkeypatch.setattr(EngineRegistry, "load", load_with_overlap)
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(runtime_module.get_model_runtime)
+        assert first_read.wait(5)
+        second = pool.submit(runtime_module.get_model_runtime)
+        runtimes = first.result(), second.result()
+    try:
+        persisted_id = load(registry)[0]["instance_id"]
+        assert [runtime.list_models()[0].instance_id for runtime in runtimes] == [
+            persisted_id,
+            persisted_id,
+        ]
+        assert not second_read.is_set()
+    finally:
+        for runtime in runtimes:
+            runtime.stop_supervisor()

@@ -152,7 +152,7 @@ func TestReconcileMovesAnEngineTheRuntimeCouldNotWake(t *testing.T) {
 	sleeper.Annotations = map[string]string{constants.ModelClaimWakeAnnotationPrefix + pm.Name: "2026-10-01T08:00:00Z"}
 	sleeperSnapshot.Models = []RuntimeSnapshotModel{{
 		ModelName: servedModelName(pm), Port: 9001, Phase: runtimePhaseSleeping, Alive: true,
-		KVUsedBytes: 100, KVCapacityBytes: 100,
+		KVUsedBytes: 100, KVCapacityBytes: 100, InstanceID: "sleeping-engine",
 		ClaimRef: &ModelClaimRef{Namespace: pm.Namespace, Name: pm.Name, UID: string(pm.UID)},
 	}}
 	roomy, roomySnapshot := sizedWarmPod("warm-2", testPeerIP, 1000)
@@ -179,6 +179,55 @@ func TestReconcileMovesAnEngineTheRuntimeCouldNotWake(t *testing.T) {
 	assert.NotContains(t, events, "WakeFailed")
 }
 
+func TestReconcileKeepsSourceUntilPendingStopIsRecorded(t *testing.T) {
+	for _, scenario := range []string{"Pod patch conflict", "older runtime", "source snapshot failed"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := context.Background()
+			claim := claimWithCost(300, 100)
+			claim.UID = "claim-uid"
+			claim.Status.Instances = []modelv1alpha1.ModelClaimInstance{{
+				Pod: "warm-1", Port: 9001, Phase: modelv1alpha1.ModelClaimFailed,
+				Reason: instanceReasonWakeFailed, KVLimitBytes: 100,
+			}}
+			source, snapshot := sizedWarmPod("warm-1", "10.0.0.1", 1000)
+			target, targetSnapshot := sizedWarmPod("warm-2", testPeerIP, 1000)
+			snapshot.Models = []RuntimeSnapshotModel{{
+				ModelName: servedModelName(claim), Port: 9001, Phase: runtimePhaseSleeping, Alive: true,
+				InstanceID: "old-engine", KVCapacityBytes: 100,
+				ClaimRef: &ModelClaimRef{Namespace: claim.Namespace, Name: claim.Name, UID: string(claim.UID)},
+			}}
+			r, runtime := newReconciler(t, claim, source, target)
+			runtime.snapshots = map[string]*RuntimeSnapshot{
+				source.Status.PodIP: snapshot, target.Status.PodIP: targetSnapshot,
+			}
+			switch scenario {
+			case "Pod patch conflict":
+				r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						if _, ok := obj.GetAnnotations()[pendingStopPrefix+string(claim.UID)]; ok {
+							return apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, obj.GetName(), fmt.Errorf("Pod updated"))
+						}
+						return c.Patch(ctx, obj, patch, opts...)
+					},
+				})
+			case "older runtime":
+				snapshot.Models[0].InstanceID = ""
+			case "source snapshot failed":
+				runtime.snapshotErrOn = map[string]error{source.Status.PodIP: fmt.Errorf("source unavailable")}
+			}
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(claim)})
+			require.NoError(t, err)
+			got := getModel(t, r, claim.Name)
+			require.Len(t, got.Status.Instances, 1)
+			assert.Equal(t, source.Name, got.Status.Instances[0].Pod)
+			assert.NotContains(t, podNamed(t, r, source.Name).Annotations, pendingStopPrefix+string(claim.UID))
+			assert.Empty(t, runtime.activateCalls)
+			assert.Empty(t, runtime.deactivateCalls)
+		})
+	}
+}
+
 func TestReconcileRetriesSourceCleanupAfterMovingAClaim(t *testing.T) {
 	pm := claimWithCost(300, 100)
 	pm.UID = types.UID("claim-uid")
@@ -191,7 +240,7 @@ func TestReconcileRetriesSourceCleanupAfterMovingAClaim(t *testing.T) {
 	sleeper.Annotations = map[string]string{constants.ModelClaimWakeAnnotationPrefix + pm.Name: "2026-10-01T08:00:00Z"}
 	sleeperSnapshot.Models = []RuntimeSnapshotModel{{
 		ModelName: servedModelName(pm), Port: 9001, Phase: runtimePhaseSleeping, Alive: true,
-		KVUsedBytes: 100, KVCapacityBytes: 100,
+		KVUsedBytes: 100, KVCapacityBytes: 100, InstanceID: "sleeping-engine",
 		ClaimRef: &ModelClaimRef{Namespace: pm.Namespace, Name: pm.Name, UID: string(pm.UID)},
 	}}
 	roomy, roomySnapshot := sizedWarmPod("warm-2", testPeerIP, 1000)
@@ -215,7 +264,10 @@ func TestReconcileRetriesSourceCleanupAfterMovingAClaim(t *testing.T) {
 	relocated := getModel(t, r, pm.Name)
 	require.Len(t, relocated.Status.Instances, 1)
 	require.Equal(t, roomy.Name, relocated.Status.Instances[0].Pod)
+	key := pendingStopPrefix + string(pm.UID)
+	require.Equal(t, "sleeping-engine", podNamed(t, r, sleeper.Name).Annotations[key])
 	require.Equal(t, []string{sleeper.Status.PodIP}, runtime.deactivatedOn)
+	require.Equal(t, "sleeping-engine", runtime.deactivateCalls[0].InstanceID)
 	roomySnapshot.Models = []RuntimeSnapshotModel{{
 		ModelName: servedModelName(pm), Port: runtime.portSeq + 9000,
 		Phase: "active", Alive: true, Ready: true, KVUsedBytes: 100,
@@ -226,20 +278,14 @@ func TestReconcileRetriesSourceCleanupAfterMovingAClaim(t *testing.T) {
 	now = now.Add(time.Second)
 	reconcileOnce(t, r, pm.Name)
 	require.Equal(t, modelv1alpha1.ModelClaimActive, getModel(t, r, pm.Name).Status.Phase)
-	require.Len(t, runtime.deactivatedOn, 1, "cleanup waits for another observation")
-
-	now = now.Add(time.Minute)
-	reconcileOnce(t, r, pm.Name)
 	require.Equal(t, []string{sleeper.Status.PodIP, sleeper.Status.PodIP}, runtime.deactivatedOn)
 	require.Equal(t, modelv1alpha1.ModelClaimActive, getModel(t, r, pm.Name).Status.Phase)
 
 	delete(runtime.deactivateErrOn, sleeper.Status.PodIP)
-	// A restart loses the observation timer, but the source is rediscovered
-	// from the runtime and the persisted destination.
-	r.relocationChecks = relocationChecks{}
-	now = now.Add(time.Minute)
-	reconcileOnce(t, r, pm.Name)
-	require.Len(t, runtime.deactivatedOn, 2)
+	restarted, _ := newReconciler(t)
+	restarted.Client, restarted.Runtime, restarted.Now = r.Client, runtime, r.Now
+	restarted.Backoff = newPlacementBackoff(r.Now)
+	r = restarted
 	now = now.Add(time.Minute)
 	reconcileOnce(t, r, pm.Name)
 	require.Equal(t, []string{sleeper.Status.PodIP, sleeper.Status.PodIP, sleeper.Status.PodIP}, runtime.deactivatedOn)
@@ -258,211 +304,16 @@ func TestReconcileRetriesSourceCleanupAfterMovingAClaim(t *testing.T) {
 	require.Empty(t, getModel(t, r, waiting.Name).Status.Instances)
 
 	sleeperSnapshot.Models = nil
-	now = now.Add(time.Minute)
+	now = now.Add(5 * time.Minute)
+	reconcileOnce(t, r, pm.Name)
 	reconcileOnce(t, r, waiting.Name)
+	assert.NotContains(t, podNamed(t, r, sleeper.Name).Annotations, key)
 	placed := getModel(t, r, waiting.Name)
 	require.Len(t, placed.Status.Instances, 1)
 	assert.Equal(t, sleeper.Name, placed.Status.Instances[0].Pod)
 }
 
-func TestRelocationCleanupRechecksOwnershipBeforeStopping(t *testing.T) {
-	for _, scenario := range []string{
-		"still recorded on source",
-		"another claim records this model on source",
-		"pod was replaced",
-		"engine changed before stop",
-		"engine is stopping",
-		"engine has no claim reference",
-		"claim read failed",
-	} {
-		t.Run(scenario, func(t *testing.T) {
-			ctx := context.Background()
-			pm := claimWithCost(300, 100)
-			pm.UID = "claim-uid"
-			pm.Status.Instances = []modelv1alpha1.ModelClaimInstance{{
-				Pod: "warm-target", Port: 9001, Phase: modelv1alpha1.ModelClaimActive,
-			}}
-			source, snapshot := sizedWarmPod("warm-source", "10.0.0.1", 1000)
-			source.UID = "source-uid"
-			snapshot.Models = []RuntimeSnapshotModel{{
-				ModelName: servedModelName(pm), Port: 9001, Phase: runtimePhaseSleeping, Alive: true,
-				ClaimRef: &ModelClaimRef{Namespace: pm.Namespace, Name: pm.Name, UID: string(pm.UID)},
-			}}
-			r, runtime := newReconciler(t, pm, source)
-			runtime.snapshots = map[string]*RuntimeSnapshot{source.Status.PodIP: snapshot}
-			now := time.Date(2026, time.October, 1, 8, 0, 5, 0, time.UTC)
-			r.Now = func() time.Time { return now }
-			candidates := []corev1.Pod{*source}
-
-			r.reconcileRelocationCleanup(ctx, pm.Namespace, candidates, newRuntimeReadings(runtime))
-			require.Empty(t, runtime.deactivateCalls)
-
-			r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
-				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					err := c.Get(ctx, key, obj, opts...)
-					if p, ok := obj.(*corev1.Pod); err == nil && ok && scenario == "pod was replaced" {
-						p.UID = "new-source-uid"
-					}
-					return err
-				},
-				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-					if scenario == "claim read failed" {
-						return fmt.Errorf("could not read claims")
-					}
-					err := c.List(ctx, list, opts...)
-					claims, ok := list.(*modelv1alpha1.ModelClaimList)
-					if err != nil || !ok {
-						return err
-					}
-					switch scenario {
-					case "still recorded on source":
-						claims.Items[0].Status.Instances[0].Pod = source.Name
-					case "another claim records this model on source":
-						other := pm.DeepCopy()
-						modelName := servedModelName(pm)
-						other.Name, other.UID, other.Spec.ModelName = "other", "other-uid", &modelName
-						other.Status.Instances[0].Pod = source.Name
-						claims.Items = append(claims.Items, *other)
-					case "engine changed before stop":
-						replacement := *snapshot
-						model := snapshot.Models[0]
-						model.Port++
-						replacement.Models = []RuntimeSnapshotModel{model}
-						runtime.snapshots[source.Status.PodIP] = &replacement
-					}
-					return nil
-				},
-			})
-			switch scenario {
-			case "engine is stopping":
-				snapshot.Models[0].Phase = runtimePhaseStopping
-			case "engine has no claim reference":
-				snapshot.Models[0].ClaimRef = nil
-			}
-			now = now.Add(time.Minute)
-			r.reconcileRelocationCleanup(ctx, pm.Namespace, candidates, newRuntimeReadings(runtime))
-			assert.Empty(t, runtime.deactivateCalls)
-			if scenario == "claim read failed" {
-				// A failed authoritative read breaks the chain of observations.
-				r.APIReader = nil
-				now = now.Add(time.Minute)
-				r.reconcileRelocationCleanup(ctx, pm.Namespace, candidates, newRuntimeReadings(runtime))
-				assert.Empty(t, runtime.deactivateCalls)
-				now = now.Add(time.Minute)
-				r.reconcileRelocationCleanup(ctx, pm.Namespace, candidates, newRuntimeReadings(runtime))
-				assert.Equal(t, []string{source.Status.PodIP}, runtime.deactivatedOn)
-			}
-		})
-	}
-}
-
-func TestRelocatedFromRequiresAuthoritativeList(t *testing.T) {
-	owner := claimWithCost(300, 100)
-	owner.Status.Instances = []modelv1alpha1.ModelClaimInstance{{Pod: "warm-target"}}
-	claims := &modelv1alpha1.ModelClaimList{Items: []modelv1alpha1.ModelClaim{*owner}}
-
-	assert.True(t, relocatedFrom(owner, "warm-source", servedModelName(owner), claims))
-	assert.False(t, relocatedFrom(owner, "warm-source", servedModelName(owner), nil))
-	assert.True(t, relocatedFrom(nil, "warm-source", servedModelName(owner), claims))
-	assert.False(t, relocatedFrom(nil, "warm-target", servedModelName(owner), claims))
-}
-
-func TestPendingClaimCanCleanItsOwnRelocatedEngine(t *testing.T) {
-	pm := claimWithCost(300, 100)
-	pm.UID = "claim-uid"
-	pm.Status.Phase = modelv1alpha1.ModelClaimActive
-	pm.Status.Instances = []modelv1alpha1.ModelClaimInstance{{
-		Pod: "lost-target", Port: 9001, Phase: modelv1alpha1.ModelClaimActive,
-	}}
-	source, snapshot := sizedWarmPod("warm-source", "10.0.0.1", 1000)
-	source.UID = "source-uid"
-	snapshot.Models = []RuntimeSnapshotModel{{
-		ModelName: servedModelName(pm), Port: 9001, Phase: runtimePhaseSleeping, Alive: true,
-		ClaimRef: &ModelClaimRef{Namespace: pm.Namespace, Name: pm.Name, UID: string(pm.UID)},
-	}}
-	r, runtime := newReconciler(t, pm, source)
-	runtime.snapshots = map[string]*RuntimeSnapshot{source.Status.PodIP: snapshot}
-	now := time.Date(2026, time.October, 1, 8, 0, 5, 0, time.UTC)
-	r.Now = func() time.Time { return now }
-	r.Backoff = newPlacementBackoff(r.Now)
-
-	reconcileOnce(t, r, pm.Name)
-	reconcileOnce(t, r, pm.Name)
-	waiting := getModel(t, r, pm.Name)
-	require.Empty(t, waiting.Status.Instances)
-	require.Equal(t, modelv1alpha1.ModelClaimPending, waiting.Status.Phase)
-	require.Empty(t, runtime.deactivateCalls)
-	now = now.Add(time.Minute)
-	reconcileOnce(t, r, pm.Name)
-	require.Equal(t, []string{source.Status.PodIP}, runtime.deactivatedOn)
-
-	snapshot.Models = nil
-	now = now.Add(time.Minute)
-	reconcileOnce(t, r, pm.Name)
-	placed := getModel(t, r, pm.Name)
-	require.Len(t, placed.Status.Instances, 1)
-	assert.Equal(t, source.Name, placed.Status.Instances[0].Pod)
-}
-
-func TestRelocationCleanupRetriesSourceAfterClaimDeletion(t *testing.T) {
-	ctx := context.Background()
-	owner := claimWithCost(300, 100)
-	owner.UID = "old-claim-uid"
-	source, sourceSnapshot := sizedWarmPod("warm-source", "10.0.0.1", 1000)
-	target, targetSnapshot := sizedWarmPod("warm-target", testPeerIP, 1000)
-	source.UID, target.UID = "source-uid", "target-uid"
-	source.Labels["cleanup-test-source"] = "true"
-	owner.Status.Instances = []modelv1alpha1.ModelClaimInstance{{
-		Pod: target.Name, Port: 9002, Phase: modelv1alpha1.ModelClaimActivating,
-	}}
-	sourceSnapshot.Models = []RuntimeSnapshotModel{{
-		ModelName: servedModelName(owner), Port: 9001, Phase: runtimePhaseSleeping, Alive: true,
-		ClaimRef: &ModelClaimRef{Namespace: owner.Namespace, Name: owner.Name, UID: string(owner.UID)},
-	}}
-	r, runtime := newReconciler(t, owner, source, target)
-	runtime.snapshots = map[string]*RuntimeSnapshot{source.Status.PodIP: sourceSnapshot, target.Status.PodIP: targetSnapshot}
-	runtime.deactivateErrOn = map[string]error{source.Status.PodIP: fmt.Errorf("source stop unavailable")}
-	now := time.Now()
-	r.Now = func() time.Time { return now }
-	r.Backoff = newPlacementBackoff(r.Now)
-	for range 2 {
-		r.reconcileRelocationCleanup(ctx, owner.Namespace, []corev1.Pod{*source}, newRuntimeReadings(runtime))
-		now = now.Add(time.Minute)
-	}
-	require.Equal(t, []string{source.Status.PodIP}, runtime.deactivatedOn)
-
-	require.NoError(t, r.Delete(ctx, getModel(t, r, owner.Name)))
-	reconcileOnce(t, r, owner.Name)
-	require.True(t, apierrors.IsNotFound(r.Get(ctx, client.ObjectKeyFromObject(owner), &modelv1alpha1.ModelClaim{})))
-	require.Equal(t, []string{source.Status.PodIP, target.Status.PodIP}, runtime.deactivatedOn)
-	delete(runtime.deactivateErrOn, source.Status.PodIP)
-	r.relocationChecks = relocationChecks{} // simulate a controller restart
-
-	waiting := claimWithCost(300, 100)
-	waiting.Name = "waiting"
-	waiting.Spec.ModelName = nil
-	waiting.Spec.PodSelector.MatchLabels["cleanup-test-source"] = "true"
-	require.NoError(t, r.Create(ctx, waiting))
-	reconcileOnce(t, r, waiting.Name)
-	require.Empty(t, getModel(t, r, waiting.Name).Status.Instances)
-	require.Equal(t, []string{source.Status.PodIP, target.Status.PodIP}, runtime.deactivatedOn)
-	now = now.Add(time.Minute)
-	reconcileOnce(t, r, waiting.Name)
-	require.Equal(t, []string{source.Status.PodIP, target.Status.PodIP, source.Status.PodIP}, runtime.deactivatedOn)
-
-	// The accepted stop still leaves the source occupied until the runtime
-	// reports that the engine has exited.
-	require.Empty(t, getModel(t, r, waiting.Name).Status.Instances)
-	sourceSnapshot.Models = nil
-	now = now.Add(time.Minute)
-	reconcileOnce(t, r, waiting.Name)
-	placed := getModel(t, r, waiting.Name)
-	require.Len(t, placed.Status.Instances, 1)
-	assert.Equal(t, source.Name, placed.Status.Instances[0].Pod)
-}
-
 func TestRelocationCleanupPreservesAnnotationsForRecreatedClaim(t *testing.T) {
-	ctx := context.Background()
 	claim := claimWithCost(300, 100)
 	claim.UID = "new-claim-uid"
 	oldModel, newModel := servedModelName(claim), "new-model"
@@ -471,23 +322,18 @@ func TestRelocationCleanupPreservesAnnotationsForRecreatedClaim(t *testing.T) {
 	pod.UID = "source-uid"
 	claim.Status.Instances = []modelv1alpha1.ModelClaimInstance{{Pod: pod.Name, Port: 9002, Phase: modelv1alpha1.ModelClaimActive}}
 	snapshot.Models = []RuntimeSnapshotModel{{
-		ModelName: oldModel, Port: 9001, Phase: runtimePhaseSleeping, Alive: true,
+		ModelName: oldModel, Port: 9001, Phase: runtimePhaseSleeping, Alive: true, InstanceID: "old-engine",
 		ClaimRef: &ModelClaimRef{Namespace: claim.Namespace, Name: claim.Name, UID: "old-claim-uid"},
 	}}
 	pod.Annotations = map[string]string{
+		pendingStopPrefix + "old-claim-uid":                   "old-engine",
 		constants.ModelClaimPodAnnotationPrefix + claim.Name:  `{"model":"new-model","port":9002,"state":"active"}`,
 		constants.ModelClaimWakeAnnotationPrefix + claim.Name: "2026-10-01T08:00:00Z",
 	}
 	r, runtime := newReconciler(t, claim, pod)
 	runtime.snapshots = map[string]*RuntimeSnapshot{pod.Status.PodIP: snapshot}
-	now := time.Date(2026, time.October, 1, 8, 0, 5, 0, time.UTC)
-	r.Now = func() time.Time { return now }
-	for range 2 {
-		r.reconcileRelocationCleanup(ctx, pod.Namespace, []corev1.Pod{*pod}, newRuntimeReadings(runtime))
-		now = now.Add(time.Minute)
-	}
-	require.Len(t, runtime.deactivateCalls, 1)
-	assert.Equal(t, oldModel, runtime.deactivateCalls[0].ModelName)
+	r.retrySourceStops(context.Background(), claim)
+	assert.Empty(t, runtime.deactivateCalls)
 	assert.Equal(t, pod.Annotations, podNamed(t, r, pod.Name).Annotations)
 }
 
@@ -551,7 +397,7 @@ func overcommittedSleeper(t *testing.T, others ...client.Object) (*ModelClaimRec
 	pod, snapshot := sizedWarmPod("warm-1", "10.0.0.1", 1000)
 	pod.Annotations = map[string]string{constants.ModelClaimWakeAnnotationPrefix + pm.Name: "2026-10-01T08:00:00Z"}
 	snapshot.Models = []RuntimeSnapshotModel{{
-		ModelName: servedModelName(pm), Port: 9001, Phase: runtimePhaseSleeping, Alive: true,
+		ModelName: servedModelName(pm), Port: 9001, InstanceID: "sleeping-engine", Phase: runtimePhaseSleeping, Alive: true,
 		KVUsedBytes: 100, KVCapacityBytes: 200,
 		ClaimRef: &ModelClaimRef{Namespace: pm.Namespace, Name: pm.Name, UID: string(pm.UID)},
 	}}
@@ -750,7 +596,7 @@ func aMoveThatDoesNotLand(t *testing.T, crowded bool) (*ModelClaimReconciler, *f
 	home.Annotations = map[string]string{constants.ModelClaimWakeAnnotationPrefix + pm.Name: "2026-10-01T08:00:00Z"}
 	homeSnapshot.Models = []RuntimeSnapshotModel{{
 		ModelName: servedModelName(pm), Port: 9001, Phase: runtimePhaseSleeping, Alive: true,
-		KVUsedBytes: 100, KVCapacityBytes: 100,
+		KVUsedBytes: 100, KVCapacityBytes: 100, InstanceID: "sleeping-engine",
 		ClaimRef: &ModelClaimRef{Namespace: pm.Namespace, Name: pm.Name, UID: string(pm.UID)},
 	}}
 	away, awaySnapshot := sizedWarmPod("warm-2", testPeerIP, 1000)

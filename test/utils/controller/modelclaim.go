@@ -400,6 +400,7 @@ func (f *FakeModelClaimRuntime) handleActivate(w http.ResponseWriter, r *http.Re
 	port := f.nextPort
 	f.nextPort++
 	model := modelclaimcontroller.RuntimeSnapshotModel{
+		InstanceID:  fmt.Sprintf("engine-%d", port),
 		ModelName:   req.ModelName,
 		ArtifactURL: req.ArtifactURL,
 		ClaimRef:    req.ClaimRef,
@@ -547,7 +548,7 @@ func (f *FakeModelClaimRuntime) handleDeactivate(w http.ResponseWriter, r *http.
 	defer f.mu.Unlock()
 	f.deactivateCalls = append(f.deactivateCalls, req)
 	for uid, model := range f.models {
-		if model.ModelName == req.ModelName {
+		if model.ModelName == req.ModelName && (req.InstanceID == "" || model.InstanceID == req.InstanceID) {
 			delete(f.models, uid)
 		}
 	}

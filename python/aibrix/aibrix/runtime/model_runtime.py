@@ -36,6 +36,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -76,7 +77,7 @@ KV_CAPACITY_VERIFY_TIMEOUT_SECONDS = 5.0
 
 @dataclass
 class ModelInstance:
-    """One engine process serving a model on the pod."""
+    """One model activation, including any supervised engine relaunches."""
 
     model_name: str
     port: int
@@ -117,6 +118,7 @@ class ModelInstance:
     )
     # Underlying process handle (None for mock); excluded from repr.
     proc: Optional[object] = field(default=None, repr=False)
+    instance_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 @dataclass(frozen=True)
@@ -1360,6 +1362,9 @@ class ModelRuntime:
                     self._increment_metric(self._re_adoption_outcomes, "duplicate")
                     continue
                 self._models[inst.model_name] = inst
+                # Persist IDs assigned to legacy records even when their phase stays the same.
+                if record.get("instance_id") != inst.instance_id:
+                    changed = True
 
                 self._refresh_kv_capacity_locked(inst, adopting=True)
 
@@ -1516,8 +1521,14 @@ class ModelRuntime:
             if "was_ready" in record
             else phase in {"active", "sleeping"}
         )
+        instance_id = record.get("instance_id")
         return ModelInstance(
             model_name=model_name,
+            instance_id=(
+                instance_id
+                if isinstance(instance_id, str) and instance_id
+                else uuid.uuid4().hex
+            ),
             port=port,
             ipc_name=ipc_name,
             engine=engine,
@@ -1588,6 +1599,7 @@ class ModelRuntime:
     def _registry_record(self, inst: ModelInstance) -> Dict[str, Any]:
         return {
             "model_name": inst.model_name,
+            "instance_id": inst.instance_id,
             "port": inst.port,
             "ipc_name": inst.ipc_name,
             "pid": inst.pid,
@@ -2009,13 +2021,32 @@ class ModelRuntime:
             write_cache_marker(model_name, artifact_url)
             return inst
 
-    def deactivate(self, model_name: str, mode: str = "stop") -> None:
+    def deactivate(
+        self, model_name: str, mode: str = "stop", *, instance_id: Optional[str] = None
+    ) -> None:
         with self._operation_lock, self._lock:
             inst = self._models.get(model_name)
-            if inst is None:
+            if inst is None or (
+                instance_id is not None and instance_id != inst.instance_id
+            ):
                 return
             if mode != "stop":
                 logger.info("deactivate mode %s is treated as stop", mode)
+            if (
+                instance_id is not None
+                and inst.phase == "failed"
+                and not inst.stop_pending
+            ):
+                # The process group already exited. Its old ID may now belong
+                # to an unrelated process.
+                self._models.pop(model_name)
+                try:
+                    self._persist_locked()
+                except Exception:
+                    self._models[model_name] = inst
+                    raise
+                self._clear_model_metric_gauges(model_name)
+                return
             self._transition(inst, "stopping")
             inst.kv_initial_capacity_bytes = None
             inst.kv_capacity_verify_until = None
@@ -2387,6 +2418,7 @@ class ModelRuntime:
             models.append(
                 {
                     "model_name": inst.model_name,
+                    "instance_id": inst.instance_id,
                     "artifact_url": inst.artifact_url,
                     "claim_ref": dict(inst.claim_ref) if inst.claim_ref else None,
                     "port": inst.port,
@@ -2482,6 +2514,7 @@ class ModelRuntime:
 # Singleton wiring for the FastAPI runtime app
 # --------------------------------------------------------------------------- #
 _AGENT: Optional[ModelRuntime] = None
+_AGENT_LOCK = threading.Lock()
 _DEFAULT_ENGINE_REGISTRY_PATH = "/var/run/aibrix/engines.json"
 
 
@@ -2492,20 +2525,22 @@ def get_model_runtime() -> ModelRuntime:
     which is what tests and dry-run deployments use.
     """
     global _AGENT
-    if _AGENT is None:
-        if os.environ.get("AIBRIX_MODEL_RUNTIME_MOCK") == "1":
-            _AGENT = ModelRuntime(
-                MockEngineLauncher(), kv_controller=MockKVController()
-            )
-        else:
-            _AGENT = ModelRuntime(
-                SubprocessEngineLauncher(),
-                kv_controller=SharedMemoryKVController(),
-                registry=EngineRegistry(
-                    os.environ.get(
-                        "AIBRIX_ENGINE_REGISTRY_PATH", _DEFAULT_ENGINE_REGISTRY_PATH
-                    )
-                ),
-                start_supervisor=True,
-            )
-    return _AGENT
+    # Concurrent first requests must share one registry re-adoption.
+    with _AGENT_LOCK:
+        if _AGENT is None:
+            if os.environ.get("AIBRIX_MODEL_RUNTIME_MOCK") == "1":
+                _AGENT = ModelRuntime(
+                    MockEngineLauncher(), kv_controller=MockKVController()
+                )
+            else:
+                _AGENT = ModelRuntime(
+                    SubprocessEngineLauncher(),
+                    kv_controller=SharedMemoryKVController(),
+                    registry=EngineRegistry(
+                        os.environ.get(
+                            "AIBRIX_ENGINE_REGISTRY_PATH", _DEFAULT_ENGINE_REGISTRY_PATH
+                        )
+                    ),
+                    start_supervisor=True,
+                )
+        return _AGENT

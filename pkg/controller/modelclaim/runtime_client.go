@@ -190,10 +190,12 @@ type ActivateResponse struct {
 	Message   string `json:"message,omitempty"`
 }
 
-// DeactivateRequest tears a model down per Mode.
+// DeactivateRequest tears a model down per Mode. When set, InstanceID
+// restricts the request to the logical activation reported by the runtime.
 type DeactivateRequest struct {
-	ModelName string         `json:"model_name"`
-	Mode      DeactivateMode `json:"mode"`
+	ModelName  string         `json:"model_name"`
+	Mode       DeactivateMode `json:"mode"`
+	InstanceID string         `json:"instance_id,omitempty"`
 }
 
 // SetKVLimitRequest applies a kvcached limit to a resident model through the
@@ -255,6 +257,7 @@ type RuntimeAcceleratorSnapshot struct {
 
 // RuntimeSnapshotModel is one engine reported by a runtime snapshot.
 type RuntimeSnapshotModel struct {
+	InstanceID  string         `json:"instance_id"`
 	ModelName   string         `json:"model_name"`
 	ArtifactURL string         `json:"artifact_url"`
 	ClaimRef    *ModelClaimRef `json:"claim_ref,omitempty"`

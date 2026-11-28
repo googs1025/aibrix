@@ -189,6 +189,19 @@ Keep API types declarative. Admission behavior belongs in webhooks,
 reconciliation policy belongs in controllers, and transport compatibility
 belongs in the relevant API or gateway layer.
 
+### ModelClaim relocation cleanup
+
+Before moving a Claim, the controller records the source engine's activation
+ID in a `model.aibrix.ai/pending-stop.<claim-uid>` annotation on the source Pod.
+The Claim's regular reconcile retries cleanup for this marker, including after
+a controller restart.
+The GPU ledger continues to account for the old engine until it releases the card.
+
+The Runtime snapshot reports the activation ID as `instance_id`. A deactivate
+request with that field stops only the matching activation. During a mixed-version
+rollout, a source engine whose Claim or activation ID cannot be verified keeps
+its assignment until the source Runtime can report that identity.
+
 ### Coding conventions
 
 - Follow existing Go package structure and standard Go style. Format Go changes

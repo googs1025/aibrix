@@ -127,8 +127,6 @@ type ModelClaimReconciler struct {
 	// LimitWarnings remembers when each engine was last warned that its KV
 	// limit did not take. It is made on first use when unset.
 	LimitWarnings *limitWarningClock
-	// Only the single ModelClaim reconcile worker accesses these checks.
-	relocationChecks relocationChecks
 }
 
 func (r *ModelClaimReconciler) now() time.Time {
@@ -349,7 +347,7 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// planner that placement uses. Each share then follows load after the
 	// placement and pool-policy changes in this pass.
 	r.divideCards(ctx, candidates, readings)
-	r.reconcileRelocationCleanup(ctx, pm.Namespace, candidates, readings)
+	r.retrySourceStops(ctx, pm)
 	// A booting engine is looked at again soon, so it is routed within a few
 	// seconds of being ready. A pass that ended before the health check, as
 	// after a start that failed, keeps its own pace.
@@ -843,9 +841,8 @@ func (r *ModelClaimReconciler) ensureActivated(
 		// being placed against the same memory while this engine loads. It also
 		// carries the KV limit the engine will be held to.
 		//
-		// A replacement takes the place of the failed instance. Its engine is
-		// stopped and its route taken back first; the other engines on that
-		// pod are left as they are.
+		// A move leaves a pending stop on the source before replacing its
+		// record. The old engine can then be stopped after placement.
 		record := modelv1alpha1.ModelClaimInstance{
 			Pod:          pod.Name,
 			Phase:        modelv1alpha1.ModelClaimActivating,
@@ -858,7 +855,13 @@ func (r *ModelClaimReconciler) ensureActivated(
 			previous := pm.Status.Instances[slot]
 			replaced = &previous
 			if !stopped[previous.Pod] {
-				r.stopFailedEngine(ctx, pm, previous.Pod, readings)
+				if movingReason(previous.Reason) {
+					if err := r.recordPendingStop(ctx, pm, previous.Pod); err != nil {
+						return 0, fmt.Errorf("record pending stop on %s: %w", previous.Pod, err)
+					}
+				} else {
+					r.stopFailedEngine(ctx, pm, previous.Pod, readings)
+				}
 				stopped[previous.Pod] = true
 			}
 			pm.Status.Instances[slot] = record

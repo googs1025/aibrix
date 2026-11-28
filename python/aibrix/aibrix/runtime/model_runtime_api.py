@@ -105,8 +105,10 @@ def activate_runtime_model(request: ActivateRuntimeModelRequest):
 # wait would stall every other endpoint of the runtime; run it in a threadpool.
 @model_runtime_router.post("/v1/runtime/models/deactivate")
 def deactivate_runtime_model(request: DeactivateRuntimeModelRequest):
-    """Deactivate a model by stopping its engine process."""
-    get_model_runtime().deactivate(request.model_name, mode=request.mode)
+    """Stop a model's engine, checking its activation ID when supplied."""
+    get_model_runtime().deactivate(
+        request.model_name, mode=request.mode, instance_id=request.instance_id
+    )
     return JSONResponse(content={"status": "success"}, status_code=200)
 
 

@@ -166,6 +166,7 @@ class DeactivateRuntimeModelRequest(NoProtectedBaseModel):
 
     model_name: str
     mode: str = "stop"
+    instance_id: Optional[str] = None
 
 
 class SetRuntimeModelKVLimitRequest(NoProtectedBaseModel):
@@ -239,6 +240,7 @@ class RuntimeSnapshotModel(NoProtectedBaseModel):
     """One runtime-managed engine in a point-in-time sidecar snapshot."""
 
     model_name: str
+    instance_id: str
     artifact_url: str
     claim_ref: Optional[RuntimeClaimRef] = None
     port: int

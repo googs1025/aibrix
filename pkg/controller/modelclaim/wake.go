@@ -96,8 +96,8 @@ func movingReason(reason string) bool {
 // its claim. That is an engine whose card is promised more than it has, and one
 // whose runtime reports that it could not wake it. The instance is marked
 // failed, with the reason, and the mark is written before anything else is done
-// to the engine. The replacement that follows in the same pass then stops the
-// engine and places the claim anew. A mark that cannot be written ends the pass,
+// to the engine. The replacement records a pending stop on the source Pod
+// before placing the claim anew. A mark that cannot be written ends the pass
 // and leaves the engine as it was. A card that cannot take the
 // engine back, with no other pod to go to, keeps the request waiting. A wake
 // that failed with no other pod to go to takes the request back, so the next
@@ -708,13 +708,9 @@ func heldAsPlannedForWake(engines []engineOnPod, limits []plannedKVLimit, waking
 // markMoving marks an instance whose engine cannot wake where it is, so that
 // the replacement of failed instances moves its claim to another pod.
 //
-// The mark is written at once. The replacement stops the engine before it
-// writes its own record, and a pass that ended between the two, on a conflict
-// or with no pod that answers, would otherwise leave the claim saying that the
-// engine sleeps, with no engine there. Written, the mark stands until the claim
-// has moved, as a failed instance does. The route says at once that the claim
-// moves, so a client is told how long to wait, even while the replacement
-// waits its turn.
+// The mark is written at once and stands until the claim moves or the move is
+// called off. The route says at once that the claim moves, so a client is told
+// how long to wait, even while the replacement waits its turn.
 func (r *ModelClaimReconciler) markMoving(
 	ctx context.Context,
 	pm *modelv1alpha1.ModelClaim,
